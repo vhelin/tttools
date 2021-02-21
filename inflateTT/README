@@ -1,0 +1,52 @@
+
+-----------------------------------------------------------------------
+-           inflateTT - Yet Another RFC-1951 Decompressor             -
+-                 Written by Ville Helin in 2007                      -
+-----------------------------------------------------------------------
+
+
+1. DESCRIPTION
+
+inflateTT is yet another commandline decompressor that implements
+the inflate decompression for deflate (RFC-1951). It's not done 100%
+according to the speficication, i.e. the header part is not like in the
+standard, but that shouldn't matter too much.
+
+The motivation behind writing this tool was to get a simple and
+efficient data compression utility that didn't depend on any libraries,
+like the pretty big and messy zlib, to my Nintendo DS homebrew projects.
+deflateTT is the compression tool that outputs files that can be
+decompressed using inflateTT.
+
+See also the stand-alone project inflateTT-DS for a modified version of
+inflateTT that you can integrate to your Nintendo DS homebrew projects
+without a hassle.
+
+
+2. CONTACT
+
+If you have any questions, feel free to contact me at
+vhelin#iki.fi.
+
+
+3. VERSION HISTORY
+
+v1.2 (06-May-2007)
+  * Added support for deflateTT v1.2 (DEFc) files.
+
+v1.1 (21-Apr-2007)
+  * The Huffman codes aren't read from the compressed files,
+    but generated from the code lengths making this more
+    RFC-1951 compatible.
+  * The code lengths are now RLE+Huffman compressed, like
+    RFC-1951 says.
+
+v1.0 (27-Jan-2007)
+  * The first public release
+
+
+4. LEGAL STUFF
+ 
+You use this on your own risk. I don't take responsibility for anything.
+Also, inflateTT is under GNU General Public Licence (GPL), version 2,
+June 1991. See the file LICENSE for more information.

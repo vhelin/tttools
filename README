@@ -1,0 +1,10 @@
+
+inflateTT (GPL v2) and deflateTT (GPL v2) are commandline tools that you can use to compress/decompress
+data. Used in e.g., Explosion of an Aeroplane to compress graphics data.
+
+inflateTT-DS (LGPL v2.1) contains decompression function inflate(), and is finetuned to work on the Nintendo DS.
+inflateTT-MP (LGPL v2.1) is the multiplatform version of inflateTT, meant to be integrated everywhere else.
+
+These implement the compression/decompression specified in RFC-1951.
+
+The sources were originally hosted at https://www.villehelin.com/nintendoDS.html but moved to GitHub in 2021.
