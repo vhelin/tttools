@@ -10,35 +10,35 @@ extern "C" {
 #define HUFFMAN_CODE_MAX_BITS 32
 
 struct InflateNode {
-	struct InflateNode *left;
-	struct InflateNode *right;
-	int literal;
+  struct InflateNode *left;
+  struct InflateNode *right;
+  int literal;
 };
 
 /* the inflate context */
 struct InflateContext {
-	/* tmp buffers for huffmanRecreateCodes() */
-	int tmpCount[HUFFMAN_CODE_MAX_BITS];
-	int nextCode[HUFFMAN_CODE_MAX_BITS+1];
+  /* tmp buffers for huffmanRecreateCodes() */
+  int tmpCount[HUFFMAN_CODE_MAX_BITS];
+  int nextCode[HUFFMAN_CODE_MAX_BITS+1];
 
-	/* code lengths */
-	int codeLengthLiterals[286];
-	int codeLengthDistances[30];
-	int codeLengthCombined[119];
+  /* code lengths */
+  int codeLengthLiterals[286];
+  int codeLengthDistances[30];
+  int codeLengthCombined[119];
 
-	/* codes */
-	int codeLiterals[286];
-	int codeDistances[30];
-	int codeCombined[119];
+  /* codes */
+  int codeLiterals[286];
+  int codeDistances[30];
+  int codeCombined[119];
 
-	/* the huffman trees */
-	struct InflateNode *treeLiterals;
-	struct InflateNode *treeDistances;
-	struct InflateNode *treeCombined;
+  /* the huffman trees */
+  struct InflateNode *treeLiterals;
+  struct InflateNode *treeDistances;
+  struct InflateNode *treeCombined;
 
-	/* the free tree nodes */
-	int treeNodesFreeCurrent;
-	struct InflateNode treeNodesFree[1024];
+  /* the free tree nodes */
+  int treeNodesFreeCurrent;
+  struct InflateNode treeNodesFree[1024];
 };
 
 /* the return values */
