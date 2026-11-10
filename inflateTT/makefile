@@ -1,31 +1,22 @@
-
 CC = gcc
-LD = gcc
+CFLAGS = -Wall -Wextra -O2 -ansi -pedantic
+INFLATE = ../inflateTT-MP
 
-CFLAGS = -Wall -c -g -O0 -ansi -pedantic
-LDFLAGS = 
+.PHONY: all clean install
 
-CFILES = main.c
-HFILES = main.h
-OFILES = main.o
-EXECUT = inflateTT
+all: inflateTT
 
+inflateTT: main.o inflate.o
+	$(CC) -o inflateTT main.o inflate.o
 
-all: $(OFILES) makefile
-	$(LD) $(LDFLAGS) $(OFILES) -o $(EXECUT) -lm
+main.o: main.c $(INFLATE)/inflate.h
+	$(CC) $(CFLAGS) -I$(INFLATE) -c main.c
 
-main.o: main.c defines.h
-	$(CC) $(CFLAGS) main.c
-
-
-$(OFILES): $(HFILES)
-
+inflate.o: $(INFLATE)/inflate.c $(INFLATE)/inflate.h
+	$(CC) $(CFLAGS) -I$(INFLATE) -c $(INFLATE)/inflate.c -o inflate.o
 
 clean:
-	rm -f $(OFILES) core *~ $(EXECUT) gmon.out
+	rm -f main.o inflate.o inflateTT inflateTT.exe
 
-nice:
-	rm -f *~ gmon.out
-
-install:
-	make; cp $(EXECUT) /usr/local/bin/
+install: inflateTT
+	cp inflateTT /usr/local/bin/

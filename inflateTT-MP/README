@@ -7,10 +7,9 @@
 
 1. DESCRIPTION
 
-inflateTT-MP is yet another decompressor that implements the inflate
-decompression for deflate (RFC-1951). It's not done 100% according to
-the speficication, i.e. the header part is not like in the standard,
-but that shouldn't matter too much.
+inflateTT-MP is the portable DEFc decompressor. Literal, length and
+distance symbols follow RFC 1951. The container is the DEFc layout
+documented in the repository README, not a zlib or raw deflate stream.
 
 The motivation behind writing this piece of code was to get a simple and
 efficient data compression utility that didn't depend on any libraries,
@@ -18,12 +17,27 @@ like the pretty big and messy zlib, to my homebrew projects.
 deflateTT is the compression tool that outputs files that can be
 decompressed using inflateTT-MP.
 
-Integrate inflate.c to your homebrew (or some other) project, and use
-inflate() to decompress deflateTT'ed data.
+Compile inflate.c into the project and call
 
-inflateTT-MP is the multiplatform version of inflateTT. Where
-inflateTT-DS is written Nintendo DS in mind, MP should cover all
-other platforms.
+  int inflate(const unsigned char *data, int dataSize,
+              unsigned char *output, int outputCapacity,
+              int *outputSize, struct InflateContext *context);
+
+outputCapacity must hold the uncompressed size from the DEFc header.
+Allocate InflateContext on the heap or in static storage; the node
+pool makes it too large for a small stack. Return values are the
+INFLATE_* codes in inflate.h.
+
+Nintendo DS VRAM wants 16-bit stores. Compile inflate_ds.c instead of
+inflate.c and call
+
+  int inflate(const unsigned char *data, int dataSize,
+              volatile unsigned short *output, int outputBytes);
+
+output must be 2-byte aligned. outputBytes is the capacity in bytes.
+This entry keeps one static context, so it is not re-entrant. Do not
+link it with inflate.o. A caller that passes its own context uses
+inflate_vram16 from inflate.c instead.
 
 
 2. CONTACT
@@ -33,6 +47,14 @@ vhelin#iki.fi.
 
 
 3. VERSION HISTORY
+
+v2.0 (10-Nov-2026)
+  * inflate() takes the input length and the output capacity and
+    reports truncated input, bad codes, bad distances and a size that
+    does not match the header. Lengths are int.
+  * The Nintendo DS entry point is inflate_ds.c in this directory.
+    The separate inflateTT-DS tree is gone.
+  * The makefile builds inflate.o and inflate_ds.o.
 
 v1.3 (25-Nov-2007)
   * The header file is now C++ compatible.

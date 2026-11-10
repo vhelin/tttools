@@ -1,10 +1,84 @@
+inflateTT (GPL v2) and deflateTT (GPL v2) are command-line tools that compress
+and decompress data. They were used in Explosion of an Aeroplane to compress
+graphics. inflateTT-MP (LGPL v2.1) is the portable library. It can write
+bytes, or 16-bit words so a Nintendo DS destination can be VRAM.
 
-inflateTT (GPL v2) and deflateTT (GPL v2) are commandline tools that you can use to compress/decompress
-data. Used in e.g., Explosion of an Aeroplane to compress graphics data.
+Literal bytes, length codes 257..285 and distance codes 0..29, including the
+extra-bit tables, match RFC 1951. The container does not. A DEFc file is not
+zlib, gzip, or a raw deflate block. The format is described below.
 
-inflateTT-DS (LGPL v2.1) contains decompression function inflate(), and is finetuned to work on the Nintendo DS.
-inflateTT-MP (LGPL v2.1) is the multiplatform version of inflateTT, meant to be integrated everywhere else.
+Build and test with gcc:
 
-These implement the compression/decompression specified in RFC-1951.
+  make
+  make test
 
-The sources were originally hosted at https://www.villehelin.com/nintendoDS.html but moved to GitHub in 2021.
+Cygwin's run looks up tests.exe before the tests directory, so this also works:
+
+  run -wait tests
+
+deflateTT reads a raw file and writes DEFc. inflateTT does the reverse.
+
+  deflateTT input.raw output.def
+  inflateTT output.def output.raw
+
+The compressor builds one Huffman block for the whole file. Matches are
+greedy LZ77 over a 32768-byte window, found with a 3-byte hash chain.
+Code lengths are limited to 15 bits. An alphabet with fewer than two used
+symbols is given two length-1 codes, so a run of identical bytes and a file
+with no repeated 3-byte sequence both round-trip.
+
+inflateTT-MP
+
+  int inflate(const unsigned char *data, int dataSize,
+              unsigned char *output, int outputCapacity,
+              int *outputSize, struct InflateContext *context);
+
+outputCapacity must be at least the uncompressed size stored in the header.
+The return value is INFLATE_OK or another INFLATE_* code from inflate.h.
+InflateContext holds the Huffman node pool (about 17 KB on a 32-bit target,
+about 30 KB on a 64-bit target). Allocate it with malloc, or keep it in
+static storage.
+
+On the DS, compile inflateTT-MP/inflate_ds.c instead of inflate.c. Do not
+link both: each defines inflate(). The DS entry point writes 16-bit words
+and keeps one static context, so it is not re-entrant:
+
+  int inflate(const unsigned char *data, int dataSize,
+              volatile unsigned short *output, int outputBytes);
+
+output must be 2-byte aligned. outputBytes is the capacity in bytes. A
+program that calls inflate_vram16 and supplies its own context compiles
+inflate.c instead, and does not use inflate_ds.c.
+
+DEFc format
+
+Offset 0, 4 bytes: 'D' 'E' 'F' 'c'.
+Offset 4, uint32 little-endian: uncompressed size.
+Offset 8, one byte N: size of the code-length alphabet (4..119).
+The encoder sets N to (longest literal or distance code) + 4.
+
+The rest is a bitstream packed MSB first inside each byte (bit 7 is first).
+There is one block. There is no BFINAL, BTYPE, stored-block type, or zlib
+wrapper.
+
+- 3 bits: width W of the following code lengths. The encoder uses 2..7.
+- N values of W bits each: code lengths for the code-length alphabet.
+- A Huffman stream of those symbols, expanding to exactly 316 lengths:
+  286 literal/length lengths, then 30 distance lengths.
+  Symbol <= N-4 is a literal length.
+  Symbol N-3 repeats the previous length. Two extra bits, count = extra+3
+  (3..6 extra copies, in addition to the length already emitted).
+  Symbol N-2 is a run of zeros. Three extra bits, count = extra+3 (3..10).
+  Symbol N-1 is a run of zeros. Seven extra bits, count = extra+11 (11..138).
+- A Huffman stream of literal/length symbols, then distances.
+  0..255 are bytes, 256 ends the block, 257..285 are match lengths.
+  Extra length and distance bits match RFC 1951.
+  A match distance must point at a byte already written.
+
+Canonical codes are assigned from the lengths as in RFC 1951 section 3.2.2.
+The encoder will not emit a code longer than 15 bits. The decoder still
+accepts codes up to 31 bits, which is as far as older deflateTT builds could
+go without overflowing a 32-bit code.
+
+The sources were originally hosted at https://www.villehelin.com/nintendoDS.html
+and moved to GitHub in 2021.

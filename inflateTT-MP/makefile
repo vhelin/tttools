@@ -1,31 +1,15 @@
-
 CC = gcc
-LD = gcc
+CFLAGS = -Wall -Wextra -O2 -ansi -pedantic -c
 
-CFLAGS = -Wall -c -g -O0 -ansi -pedantic
-LDFLAGS = 
+.PHONY: all clean
 
-CFILES = main.c
-HFILES = main.h
-OFILES = main.o
-EXECUT = inflateTT
+all: inflate.o inflate_ds.o
 
+inflate.o: inflate.c inflate.h
+	$(CC) $(CFLAGS) inflate.c
 
-all: $(OFILES) makefile
-	$(LD) $(LDFLAGS) $(OFILES) -o $(EXECUT) -lm
-
-main.o: main.c defines.h
-	$(CC) $(CFLAGS) main.c
-
-
-$(OFILES): $(HFILES)
-
+inflate_ds.o: inflate_ds.c inflate_ds.h inflate.c inflate.h
+	$(CC) $(CFLAGS) inflate_ds.c
 
 clean:
-	rm -f $(OFILES) core *~ $(EXECUT) gmon.out
-
-nice:
-	rm -f *~ gmon.out
-
-install:
-	make; cp $(EXECUT) /usr/local/bin/
+	rm -f inflate.o inflate_ds.o

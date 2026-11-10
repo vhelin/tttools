@@ -7,10 +7,9 @@
 
 1. DESCRIPTION
 
-inflateTT is yet another commandline decompressor that implements
-the inflate decompression for deflate (RFC-1951). It's not done 100%
-according to the speficication, i.e. the header part is not like in the
-standard, but that shouldn't matter too much.
+inflateTT is a command-line decompressor for DEFc files written by
+deflateTT. It is a file-I/O wrapper around inflateTT-MP. See the
+repository README for the bitstream, which is not a zlib stream.
 
 The motivation behind writing this tool was to get a simple and
 efficient data compression utility that didn't depend on any libraries,
@@ -18,9 +17,8 @@ like the pretty big and messy zlib, to my Nintendo DS homebrew projects.
 deflateTT is the compression tool that outputs files that can be
 decompressed using inflateTT.
 
-See also the stand-alone project inflateTT-DS for a modified version of
-inflateTT that you can integrate to your Nintendo DS homebrew projects
-without a hassle.
+Nintendo DS projects compile inflateTT-MP/inflate_ds.c. That file is the
+16-bit entry point and keeps its own context.
 
 
 2. CONTACT
@@ -30,6 +28,11 @@ vhelin#iki.fi.
 
 
 3. VERSION HISTORY
+
+v2.0 (10-Nov-2026)
+  * Uses inflateTT-MP. Truncated, oversized and inconsistent input
+    returns an error instead of walking off a buffer.
+  * The test program is tests.exe in the repository root.
 
 v1.2 (06-May-2007)
   * Added support for deflateTT v1.2 (DEFc) files.

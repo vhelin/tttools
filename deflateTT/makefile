@@ -1,31 +1,21 @@
-
 CC = gcc
-LD = gcc
+CFLAGS = -Wall -Wextra -O2 -ansi -pedantic
 
-CFLAGS = -Wall -c -g -O0 -ansi -pedantic
-LDFLAGS = 
+.PHONY: all clean install
 
-CFILES = main.c
-HFILES = main.h
-OFILES = main.o
-EXECUT = deflateTT
+all: deflateTT
 
+deflateTT: main.o huffman.o
+	$(CC) -o deflateTT main.o huffman.o
 
-all: $(OFILES) makefile
-	$(LD) $(LDFLAGS) $(OFILES) -o $(EXECUT) -lm
+main.o: main.c deflate.h huffman.h
+	$(CC) $(CFLAGS) -c main.c
 
-main.o: main.c defines.h
-	$(CC) $(CFLAGS) main.c
-
-
-$(OFILES): $(HFILES)
-
+huffman.o: huffman.c huffman.h
+	$(CC) $(CFLAGS) -c huffman.c
 
 clean:
-	rm -f $(OFILES) core *~ $(EXECUT) gmon.out
+	rm -f main.o huffman.o deflateTT deflateTT.exe
 
-nice:
-	rm -f *~ gmon.out
-
-install:
-	make; cp $(EXECUT) /usr/local/bin/
+install: deflateTT
+	cp deflateTT /usr/local/bin/

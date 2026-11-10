@@ -1,471 +1,287 @@
-
 /*
  * deflateTT, compresses data that can be uncompressed using inflateTT.
- * This is almost according to the RFC-1951 (DEFLATE Compressed Data Format
- * Specification version 1.3), only the header is different. I was too lazy
- * to implement them the standard way.
+ * Literals, lengths and distances follow RFC 1951. The container is the
+ * DEFc format described in the repository README: MSB-first bits, one
+ * block, and a custom code-length header.
  *
  * Programmed by Ville Helin <vhelin#iki.fi> in 2007.
+ * Hash-chained LZ77, 15-bit Huffman limits and I/O checks added in 2026.
  *
  * This code is under GNU General Public Licence (GPL), version 2, June 1991.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <math.h>
+#include <limits.h>
 
-#include "defines.h"
-#include "main.h"
+#include "deflate.h"
+#include "huffman.h"
 
 
-/* the huffman frequencies */
-int freqLiterals[286];
-int freqDistances[30];
-int freqCombined[119];
+#define LZ_MAX_DIST 32768
+#define LZ_MAX_LEN  258
+#define LZ_MIN_LEN  3
+#define LZ_HASH_BITS 15
+#define LZ_HASH_SIZE (1 << LZ_HASH_BITS)
 
-/* code lengths */
-int codeLengthLiterals[286];
-int codeLengthDistances[30];
-int codeLengthCombined[119];
-int codeLengths[286+30];
+#define LIT_SYMBOLS  286
+#define DIST_SYMBOLS 30
+#define LENGTH_TOTAL (LIT_SYMBOLS + DIST_SYMBOLS)
 
-/* codes */
-int codeLiterals[286];
-int codeDistances[30];
-int codeCombined[119];
 
-/* the huffman trees */
-struct node *treeLiterals = NULL;
-struct node *treeDistances = NULL;
-struct node *treeCombined = NULL;
+static int freqLiterals[LIT_SYMBOLS];
+static int freqDistances[DIST_SYMBOLS];
+static int freqCombined[119];
 
-/* the priority node queue */
-struct node *priorityQueue = NULL;
+static int codeLengthLiterals[LIT_SYMBOLS];
+static int codeLengthDistances[DIST_SYMBOLS];
+static int codeLengthCombined[119];
+static int codeLengths[LENGTH_TOTAL];
 
-/* the number of extra bits in the compressed data */
-const int extraBitsLengths[] = {
+static int codeLiterals[LIT_SYMBOLS];
+static int codeDistances[DIST_SYMBOLS];
+static int codeCombined[119];
+
+
+static const int extraBitsLengths[29] = {
   0, 0, 0, 0, 0, 0, 0, 0, 1, 1,
   1, 1, 2, 2, 2, 2, 3, 3, 3, 3,
   4, 4, 4, 4, 5, 5, 5, 5, 0
 };
-const int extraBitsDistances[] = {
+static const int extraBitsDistances[30] = {
   0, 0, 0, 0, 1, 1, 2, 2, 3, 3,
   4, 4, 5, 5, 6, 6, 7, 7, 8, 8,
   9, 9, 10, 10, 11, 11, 12, 12, 13, 13
 };
 
-/* limits for length encoding */
-const int extraBitsLimitsLength[] = {
+/* First length that needs the next length code. Index 0 is length 11. */
+static const int extraBitsLimitsLength[21] = {
   11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258
 };
-
-/* limits for distance encoding */
-const int extraBitsLimitsDistance[] = {
+static const int extraBitsLimitsDistance[27] = {
   5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577, 32769
 };
 
 
-static void _write_u32(FILE *f, int data) {
+struct bitbuf {
+  unsigned char *data;
+  int len;
+  int cap;
+  unsigned int acc;
+  int nbits;
+};
 
-  fprintf(f, "%c%c%c%c", data & 0xFF, (data >> 8) & 0xFF, (data >> 16) & 0xFF, (data >> 24) & 0xFF);
+
+static int bitbuf_init(struct bitbuf *b, int cap) {
+
+  if (cap < 64)
+    cap = 64;
+  b->data = (unsigned char *)malloc(cap);
+  if (b->data == NULL)
+    return -1;
+  b->len = 0;
+  b->cap = cap;
+  b->acc = 0;
+  b->nbits = 0;
+  return 0;
 }
 
 
-static void _write_u8(FILE *f, int data) {
+static int bitbuf_grow(struct bitbuf *b, int need) {
 
-  fprintf(f, "%c", data & 0xFF);
+  int cap;
+  unsigned char *p;
+
+  if (need < 0 || b->len < 0 || b->len > INT_MAX - need)
+    return -1;
+  if (b->len + need <= b->cap)
+    return 0;
+
+  cap = b->cap > 0 ? b->cap : 64;
+  while (b->len + need > cap) {
+    if (cap > INT_MAX / 2)
+      return -1;
+    cap *= 2;
+  }
+
+  p = (unsigned char *)realloc(b->data, cap);
+  if (p == NULL)
+    return -1;
+  b->data = p;
+  b->cap = cap;
+  return 0;
 }
 
 
-static void _write_bits(FILE *f, int *outBitsN, int *outBits, int code, int codeLength) {
+static int bitbuf_byte(struct bitbuf *b, unsigned char value) {
+
+  if (bitbuf_grow(b, 1) != 0)
+    return -1;
+  b->data[b->len++] = value;
+  return 0;
+}
+
+
+/* MSB first, matching the inflater. A length of 0 writes nothing. */
+static int bitbuf_bits(struct bitbuf *b, unsigned int code, int codeLength) {
 
   int i;
+
+  if (codeLength < 0 || codeLength > 15)
+    return -1;
 
   for (i = 0; i < codeLength; i++) {
-    *outBits = (*outBits << 1) | ((code >> (codeLength - i - 1)) & 1);
-    *outBitsN += 1;
-
-    if (*outBitsN == 8) {
-      _write_u8(f, *outBits);
-      *outBits = 0;
-      *outBitsN = 0;
+    b->acc = (b->acc << 1) | ((code >> (codeLength - i - 1)) & 1U);
+    b->nbits++;
+    if (b->nbits == 8) {
+      if (bitbuf_byte(b, (unsigned char)b->acc) != 0)
+        return -1;
+      b->acc = 0;
+      b->nbits = 0;
     }
   }
+  return 0;
 }
 
 
-/*
-  Extra               Extra               Extra
-  Code Bits Length(s) Code Bits Lengths   Code Bits Length(s)
-  ---- ---- ------     ---- ---- -------   ---- ---- -------
-  257   0     3       267   1   15,16     277   4   67-82
-  258   0     4       268   1   17,18     278   4   83-98
-  259   0     5       269   2   19-22     279   4   99-114
-  260   0     6       270   2   23-26     280   4  115-130
-  261   0     7       271   2   27-30     281   5  131-162
-  262   0     8       272   2   31-34     282   5  163-194
-  263   0     9       273   3   35-42     283   5  195-226
-  264   0    10       274   3   43-50     284   5  227-257
-  265   1  11,12      275   3   51-58     285   0    258
-  266   1  13,14      276   3   59-66
+static int bitbuf_finish(struct bitbuf *b) {
 
-  Extra           Extra               Extra
-  Code Bits Dist  Code Bits   Dist     Code Bits Distance
-  ---- ---- ----  ---- ----  ------    ---- ---- --------
-  0   0    1     10   4     33-48    20    9   1025-1536
-  1   0    2     11   4     49-64    21    9   1537-2048
-  2   0    3     12   5     65-96    22   10   2049-3072
-  3   0    4     13   5     97-128   23   10   3073-4096
-  4   1   5,6    14   6    129-192   24   11   4097-6144
-  5   1   7,8    15   6    193-256   25   11   6145-8192
-  6   2   9-12   16   7    257-384   26   12  8193-12288
-  7   2  13-16   17   7    385-512   27   12 12289-16384
-  8   3  17-24   18   8    513-768   28   13 16385-24576
-  9   3  25-32   19   8   769-1024   29   13 24577-32768
-*/
-
-
-void priorityQueuePush(struct node *node) {
-
-  struct node *queue = priorityQueue;
-
-  node->smaller = NULL;
-  node->larger = NULL;
-
-  if (queue == NULL) {
-    priorityQueue = node;
-    return;
-  }
-
-  while (1) {
-    if (node->weight > queue->weight) {
-      if (queue->larger != NULL)
-        queue = queue->larger;
-      else {
-        queue->larger = node;
-        node->smaller = queue;
-        return;
-      }
-    }
-    else {
-      node->smaller = queue->smaller;
-      node->larger = queue;
-      if (queue->smaller != NULL)
-        queue->smaller->larger = node;
-      queue->smaller = node;
-
-      if (queue == priorityQueue)
-        priorityQueue = node;
-
-      return;
-    }
-  }
+  if (b->nbits == 0)
+    return 0;
+  return bitbuf_byte(b, (unsigned char)(b->acc << (8 - b->nbits)));
 }
 
 
-struct node *priorityQueuePop(void) {
+static unsigned lz_hash(const unsigned char *p) {
 
-  struct node *node = priorityQueue;
-
-  if (node == NULL)
-    return NULL;
-
-  priorityQueue = node->larger;
-  if (priorityQueue != NULL)
-    priorityQueue->smaller = NULL;
-
-  return node;
+  return (unsigned)(((p[0] << 10) ^ (p[1] << 5) ^ p[2]) & (LZ_HASH_SIZE - 1));
 }
 
 
-void propagateCodes(struct node *node, int code, int codeLength) {
+/* Greedy LZ77. A 3-byte hash chain replaces the old window scan.
+   The longest match wins, and an equal length keeps the nearer one. */
+static int lz77_compress(const unsigned char *data, int fileSize, int *lz77,
+                         int lz77Cap, int *lz77SizeOut, int *matches, int *dupBytes) {
 
-  if (node->leaf == YES) {
-    node->code = code;
-    node->codeLength = codeLength;
-    return;
-  }
+  int *head, *prev;
+  int i, h, j, n, dist, chain, bestLen, bestDist, lz77Size;
+  int matchCount, duplicateBytes;
 
-  if (node->left != NULL)
-    propagateCodes(node->left, (code << 1) | 1, codeLength + 1);
-  if (node->right != NULL)
-    propagateCodes(node->right, (code << 1) | 0, codeLength + 1);
-}
-
-
-void huffmanGrowTree(int *frequencies, int n, struct node **tree, int *codeLengths, int *codes) {
-
-  struct node *nodes, *node1, *node2, *node;
-  int i;
-
-  /* init the nodes */
-  nodes = malloc(sizeof(struct node) * n);
-  if (nodes == NULL) {
-    fprintf(stderr, "huffmanGrowTree(): Out of memory error [1].\n");
-    return;
-  }
-
-  for (i = 0; i < n; i++) {
-    nodes[i].left = NULL;
-    nodes[i].right = NULL;
-    nodes[i].literal = i;
-    nodes[i].weight = frequencies[i];
-    nodes[i].leaf = YES;
-    nodes[i].code = 0;
-    nodes[i].codeLength = 0;
-  }
-
-  /* push the nodes into a priority queue */
-  priorityQueue = NULL;
-
-  for (i = 0; i < n; i++) {
-    if (nodes[i].weight > 0)
-      priorityQueuePush(&nodes[i]);
-  }
-
-  /* DEBUG */
-  /*
-    {
-    struct node *node = priorityQueue;
-
-    while (node != NULL) {
-    fprintf(stderr, "%d ", node->weight);
-    node = node->larger;
-    }
-    }
-  */
-
-  /* create a tree */
-  while (1) {
-    /* pop the two rarest nodes */
-    node1 = priorityQueuePop();
-    node2 = priorityQueuePop();
-
-    if (node2 == NULL) {
-      /* the tree has been built */
-      *tree = node1;
-      break;
-    }
-
-    /* create a parent node */
-    node = malloc(sizeof(struct node));
-    if (node == NULL) {
-      fprintf(stderr, "huffmanGrowTree(): Out of memory error [2].\n");
-      return;
-    }
-
-    node->code = 0;
-    node->codeLength = 0;
-    node->leaf = NO;
-    node->literal = 0xDEADBEEF;
-    node->weight = node1->weight + node2->weight;
-    node->left = node1;
-    node->right = node2;
-
-    /* push the parent back to the queue */
-    priorityQueuePush(node);
-  }
-
-  /* calculate the codes and code lengths */
-  propagateCodes(*tree, 0, 0);
-
-  /* collect the codes and code lengths */
-  for (i = 0; i < n; i++) {
-    codes[i] = nodes[i].code;
-    codeLengths[i] = nodes[i].codeLength;
-  }
-
-  /* DEBUG */
-  /*
-    for (i = 0; i < n; i++)
-    fprintf(stderr, "%d/%d ", frequencies[i], codeLengths[i]);
-  */
-}
-
-
-/* the number of bits we can have in a code */
-#define HUFFMAN_CODE_MAX_BITS 32
-
-/* tmp buffers for huffmanRecreateCodes() */
-int tmpCount[HUFFMAN_CODE_MAX_BITS], nextCode[HUFFMAN_CODE_MAX_BITS+1];
-
-
-void huffmanRecreateCodes(int n, int *lengths, int *codes) {
-
-  int i, code, bits, length;
-
-  /* for more information about this, see RFC-1951 section 3.2.2 */
-
-  /* step 1: count the lengths */
-  for (i = 0; i < HUFFMAN_CODE_MAX_BITS; i++)
-    tmpCount[i] = 0;
-
-  for (i = 0; i < n; i++)
-    tmpCount[lengths[i]]++;
-
-  /*
-    for (i = 0; i < HUFFMAN_CODE_MAX_BITS; i++)
-    fprintf(stderr, "%d ", tmpCount[i]);
-    fprintf(stderr, "\n");
-  */
-
-  /* step 2: find the numerical value of the smallest code for each code length */
-  code = 0;
-  tmpCount[0] = 0;
-  for (bits = 1; bits <= HUFFMAN_CODE_MAX_BITS; bits++) {
-    code = (code + tmpCount[bits - 1]) << 1;
-    nextCode[bits] = code;
-  }
-
-  /* step 3: assign numerical values to all codes, using consecutive
-     values for all codes of the same length with the base
-     values determined at step 2. */
-  for (i = 0; i < n; i++) {
-    length = lengths[i];
-    if (length != 0) {
-      /*
-        fprintf(stderr, "oldCode = %d newCode = %d\n", codes[i], nextCode[length]);
-      */
-      codes[i] = nextCode[length];
-      nextCode[length]++;
-    }
-  }
-}
-
-
-int main(int argc, char *argv[]) {
-
-  int fileSize, *lz77, lz77Size, j, i, k, m, n, lz77Best, lz77Length, lz77Matches, lz77DuplicateBytes, codeLengthsN, codeLengthMax, codesN;
-  unsigned char *data;
-  FILE *f;
-
-  if (argc != 3) {
-    fprintf(stderr, "deflateTT v1.1 Written by Ville Helin 2007\n");
-    fprintf(stderr, "USAGE: %s <IN RAW> <OUT DEF>\n", argv[0]);
-    return 1;
-  }
-
-  /********************************************************************************/
-  /* INPUT */
-  /********************************************************************************/
-
-  /* read the RAW file */
-  f = fopen(argv[1], "rb");
-  if (f == NULL) {
-    fprintf(stderr, "main(): Could not open file \"%s\" for reading.\n", argv[1]);
-    return 1;
-  }
-
-  /* get the file size */
-  fseek(f, 0, SEEK_END);
-  fileSize = ftell(f);
-  fseek(f, 0, SEEK_SET);
-
-  data = malloc(fileSize);
-  if (data == NULL) {
-    fprintf(stderr, "main(): Out of memory error [1].\n");
-    fclose(f);
-    return 1;
-  }
-
-  fread(data, 1, fileSize, f);
-  fclose(f);
-
-  /********************************************************************************/
-  /* ~LZ77 */
-  /********************************************************************************/
-
-  /* allocate room for the lz77 compressed data */
-  lz77 = malloc(sizeof(int) * fileSize * 3);
-  if (lz77 == NULL) {
-    fprintf(stderr, "main(): Out of memory error [2].\n");
-    return 1;
-  }
-
-  /* LZ77 */
-  i = 0;
+  head = NULL;
+  prev = NULL;
+  matchCount = 0;
+  duplicateBytes = 0;
   lz77Size = 0;
-  lz77Matches = 0;
-  lz77DuplicateBytes = 0;
 
-  while (i < fileSize) {
-    /* find the longest match */
-    j = i - 0x7FFF + 1;
-    if (j < 0)
-      j = 0;
+  if (fileSize < 0 || lz77 == NULL || lz77Cap < 1)
+    return -1;
 
-    lz77Best = -1;
-    lz77Length = -1;
-
-    while (j < i) {
-      k = j;
-      m = i;
-      n = 0;
-      while (m < fileSize && data[k] == data[m] && n < 258) {
-        k++;
-        m++;
-        n++;
-      }
-
-      if (n >= lz77Length) {
-        lz77Best = j;
-        lz77Length = n;
-      }
-
-      j++;
+  if (fileSize > 0) {
+    head = (int *)malloc(sizeof(int) * LZ_HASH_SIZE);
+    prev = (int *)malloc(sizeof(int) * fileSize);
+    if (head == NULL || prev == NULL) {
+      free(head);
+      free(prev);
+      return -1;
     }
-
-    if (lz77Length > 2) {
-      /* we found a good match -> store */
-      lz77[lz77Size++] = lz77Length + 254; /* 3 -> 257 */
-      lz77[lz77Size++] = i - lz77Best;
-
-      /* count statistics */
-      lz77Matches++;
-      lz77DuplicateBytes += lz77Length;
-
-      /* move to pointer over the copied area */
-      i += lz77Length - 1;
-    }
-    else {
-      /* just output the data byte */
-      lz77[lz77Size++] = data[i];
-    }
-
-    i++;
+    for (i = 0; i < LZ_HASH_SIZE; i++)
+      head[i] = -1;
   }
 
-  /* output the end marker */
+  i = 0;
+  while (i < fileSize) {
+    bestLen = 0;
+    bestDist = 0;
+
+    if (i + LZ_MIN_LEN <= fileSize) {
+      h = (int)lz_hash(data + i);
+      chain = 0;
+      for (j = head[h]; j >= 0; j = prev[j]) {
+        chain++;
+        if (chain > fileSize)
+          break;
+        dist = i - j;
+        if (dist <= 0 || dist > LZ_MAX_DIST)
+          break;
+        if (i + bestLen < fileSize && data[j + bestLen] != data[i + bestLen])
+          continue;
+        n = 0;
+        while (n < LZ_MAX_LEN && i + n < fileSize && data[j + n] == data[i + n])
+          n++;
+        if (n > bestLen) {
+          bestLen = n;
+          bestDist = dist;
+          if (bestLen == LZ_MAX_LEN || i + bestLen == fileSize)
+            break;
+        }
+      }
+      prev[i] = head[h];
+      head[h] = i;
+    }
+
+    if (bestLen >= LZ_MIN_LEN) {
+      int k;
+
+      if (lz77Size + 2 >= lz77Cap) {
+        free(head);
+        free(prev);
+        return -1;
+      }
+      lz77[lz77Size++] = bestLen + 254;
+      lz77[lz77Size++] = bestDist;
+      matchCount++;
+      duplicateBytes += bestLen;
+
+      for (k = 1; k < bestLen; k++) {
+        if (i + k + LZ_MIN_LEN <= fileSize) {
+          h = (int)lz_hash(data + i + k);
+          prev[i + k] = head[h];
+          head[h] = i + k;
+        }
+      }
+      i += bestLen;
+    }
+    else {
+      if (lz77Size + 1 >= lz77Cap) {
+        free(head);
+        free(prev);
+        return -1;
+      }
+      lz77[lz77Size++] = data[i];
+      i++;
+    }
+  }
+
+  if (lz77Size + 1 > lz77Cap) {
+    free(head);
+    free(prev);
+    return -1;
+  }
   lz77[lz77Size++] = 256;
 
-  /* print statistics */
-  fprintf(stderr, "main(): LZ77: %d utilized matches | %d duplicate bytes.\n", lz77Matches, lz77DuplicateBytes);
+  free(head);
+  free(prev);
+  *lz77SizeOut = lz77Size;
+  if (matches != NULL)
+    *matches = matchCount;
+  if (dupBytes != NULL)
+    *dupBytes = duplicateBytes;
+  return 0;
+}
 
-  /********************************************************************************/
-  /* PREPROCESS LZ77 -> HUFFMAN */
-  /********************************************************************************/
+
+static int preprocess_lz77(int *lz77, int lz77Size) {
+
+  int i, j, n;
 
   for (i = 0; i < lz77Size; i++) {
-    /*
-      fprintf(stderr, "main(): %d\n", lz77[i]);
-    */
-
-    /* skip plain data bytes (and the end marker) */
     if (lz77[i] < 257)
       continue;
 
-    /* we have a length value -> transform */
     n = lz77[i] - 254;
-
-    /*
-      fprintf(stderr, "  length = %d\n", n);
-    */
-
     if (n > 10) {
       for (j = 0; j < 20; j++) {
         if (n < extraBitsLimitsLength[j + 1]) {
-          /* store the extra bits in the upper 16 bits */
           lz77[i] = (265 + j) | ((n - extraBitsLimitsLength[j]) << 16);
           break;
         }
@@ -473,21 +289,20 @@ int main(int argc, char *argv[]) {
       if (j == 20) {
         if (n == 258)
           lz77[i] = 285;
-        else
+        else {
           fprintf(stderr, "main(): Unsupported length %d in LZ77 preprocess.\n", n);
+          return -1;
+        }
       }
     }
 
-    /* move to distance */
     i++;
+    if (i >= lz77Size) {
+      fprintf(stderr, "main(): LZ77 length is missing its distance.\n");
+      return -1;
+    }
 
-    /* transform the distance */
     n = lz77[i];
-
-    /*
-      fprintf(stderr, "  distance = %d\n", n);
-    */
-
     if (n == 1)
       lz77[i] = 0;
     else if (n == 2)
@@ -499,97 +314,43 @@ int main(int argc, char *argv[]) {
     else {
       for (j = 0; j < 26; j++) {
         if (n < extraBitsLimitsDistance[j + 1]) {
-          /* store the extra bits in the upper 16 bits */
           lz77[i] = (4 + j) | ((n - extraBitsLimitsDistance[j]) << 16);
           break;
         }
       }
-      if (j == 26)
+      if (j == 26) {
         fprintf(stderr, "main(): Unsupported distance %d in LZ77 preprocess.\n", n);
+        return -1;
+      }
     }
   }
 
-  /********************************************************************************/
-  /* HUFFMAN */
-  /********************************************************************************/
+  return 0;
+}
 
-  /* zero the frequencies */
-  for (i = 0; i < 286; i++)
-    freqLiterals[i] = 0;
-  for (i = 0; i < 30; i++)
-    freqDistances[i] = 0;
 
-  /* calculate the frequencies */
-  i = 0;
-  while (i < lz77Size) {
-    /* plain data bytes, and the end marker */
-    n = lz77[i++] & 0xFFFF;
+static int rle_code_lengths(int *lengths, int codeLengthMax, int *outCount) {
 
-    if (n < 257) {
-      freqLiterals[n]++;
-    }
-    else {
-      /* length and distance */
-      freqLiterals[n]++;
-      n = lz77[i++] & 0xFFFF;
-      freqDistances[n]++;
-    }
-  }
+  int i, j, k, m;
 
-  /* DEBUG */
-  /*
-    for (i = 0; i < 286; i++)
-    fprintf(stderr, "main(): Literal %.3d: %d occurrences.\n", i, freqLiterals[i]);
-    for (i = 0; i < 30; i++)
-    fprintf(stderr, "main(): Distance %.2d: %d occurrences.\n", i, freqDistances[i]);
-  */
-
-  /* create the trees */
-  huffmanGrowTree(freqLiterals, 286, &treeLiterals, codeLengthLiterals, codeLiterals);
-  huffmanGrowTree(freqDistances, 30, &treeDistances, codeLengthDistances, codeDistances);
-
-  /* rewrite the codes, so that the decoder can create them as well using the same code */
-  huffmanRecreateCodes(286, codeLengthLiterals, codeLiterals);
-  huffmanRecreateCodes(30, codeLengthDistances, codeDistances);
-
-  /********************************************************************************/
-  /* COMPRESS CODE LENGTHS */
-  /********************************************************************************/
-
-  /* merge the code lengths */
-  j = 0;
-  for (i = 0; i < 286; i++)
-    codeLengths[j++] = codeLengthLiterals[i];
-  for (i = 0; i < 30; i++)
-    codeLengths[j++] = codeLengthDistances[i];
-
-  /* find the longest code */
-  codeLengthMax = 0;
-  for (i = 0; i < 286+30; i++) {
-    if (codeLengthMax < codeLengths[i])
-      codeLengthMax = codeLengths[i];
-  }
-  codesN = codeLengthMax + 4;
-
-  /* RLE compress the code lengths */
   i = 0;
   j = 0;
-  while (i < 286 + 30) {
-    m = codeLengths[i];
+  while (i < LENGTH_TOTAL) {
+    m = lengths[i];
 
-    if (m > 115) {
-      fprintf(stderr, "main(): Got a code length of %d bits (> 115)!\n", m);
-      return 1;
+    if (m < 0 || m > 15) {
+      fprintf(stderr, "main(): Got a code length of %d bits.\n", m);
+      return -1;
     }
 
     if (m != 0) {
-      /* output nonzeros as they are */
-      codeLengths[j++] = m;
+      if (j >= LENGTH_TOTAL)
+        return -1;
+      lengths[j++] = m;
 
-      /* ... but does the symbol repeat? */
       k = 0;
-      while (i + k < 286+30) {
-        if (codeLengths[i + k] != m)
+      while (i + k < LENGTH_TOTAL) {
+        if (lengths[i + k] != m)
           break;
         if (k == 7)
           break;
@@ -602,92 +363,214 @@ int main(int argc, char *argv[]) {
       if (k < 3)
         continue;
 
-      /*
-        fprintf(stderr, "%d repeats %d\n", m, k);
-      */
-
-      codeLengths[j++] = (codeLengthMax + 1) | ((k - 3) << 16);
+      if (j >= LENGTH_TOTAL)
+        return -1;
+      lengths[j++] = (codeLengthMax + 1) | ((k - 3) << 16);
       i += k;
     }
     else {
-      /* RLE compress zeros */
       k = 1;
       i++;
-      while (i < 286+30 && k < 138) {
-        if (codeLengths[i] != 0)
+      while (i < LENGTH_TOTAL && k < 138) {
+        if (lengths[i] != 0)
           break;
         k++;
         i++;
       }
 
-      /* got k zeros */
       if (k < 3) {
         while (k > 0) {
-          codeLengths[j++] = 0;
+          if (j >= LENGTH_TOTAL)
+            return -1;
+          lengths[j++] = 0;
           k--;
         }
       }
-      else if (k < 11)
-        codeLengths[j++] = (codeLengthMax + 2) | ((k -  3) << 16);
-      else
-        codeLengths[j++] = (codeLengthMax + 3) | ((k - 11) << 16);
+      else if (k < 11) {
+        if (j >= LENGTH_TOTAL)
+          return -1;
+        lengths[j++] = (codeLengthMax + 2) | ((k - 3) << 16);
+      }
+      else {
+        if (j >= LENGTH_TOTAL)
+          return -1;
+        lengths[j++] = (codeLengthMax + 3) | ((k - 11) << 16);
+      }
     }
   }
 
-  /* now we have k items in the code length array */
-  codeLengthsN = j;
+  *outCount = j;
+  return 0;
+}
 
-  /* calculate the frequencies */
+
+int deflate_bytes(const unsigned char *input, int inputSize,
+                  unsigned char **output, int *outputSize,
+                  int *matches, int *duplicateBytes) {
+
+  int *lz77;
+  int lz77Size, i, j, k, m, n;
+  int codeLengthMax, codesN, codeLengthsN;
+  int matchCount, dupBytes, allocCount;
+  struct bitbuf bits;
+
+  lz77 = NULL;
+  bits.data = NULL;
+  matchCount = 0;
+  dupBytes = 0;
+
+  if (output == NULL || outputSize == NULL)
+    return -1;
+  *output = NULL;
+  *outputSize = 0;
+
+  if (inputSize < 0 || (inputSize > 0 && input == NULL)) {
+    fprintf(stderr, "main(): Bad input.\n");
+    return -1;
+  }
+
+  if (inputSize > 0 &&
+      (unsigned long)inputSize > ((unsigned long)-1 / sizeof(int)) - 1UL) {
+    fprintf(stderr, "main(): Input is too large.\n");
+    return -1;
+  }
+
+  if (inputSize == INT_MAX) {
+    fprintf(stderr, "main(): Input is too large.\n");
+    return -1;
+  }
+
+  allocCount = inputSize + 1;
+  lz77 = (int *)malloc(sizeof(int) * allocCount);
+  if (lz77 == NULL) {
+    fprintf(stderr, "main(): Out of memory error.\n");
+    return -1;
+  }
+
+  if (lz77_compress(input, inputSize, lz77, allocCount, &lz77Size,
+                    &matchCount, &dupBytes) != 0) {
+    fprintf(stderr, "main(): LZ77 failed.\n");
+    free(lz77);
+    return -1;
+  }
+
+  if (matches != NULL)
+    *matches = matchCount;
+  if (duplicateBytes != NULL)
+    *duplicateBytes = dupBytes;
+
+  if (preprocess_lz77(lz77, lz77Size) != 0) {
+    free(lz77);
+    return -1;
+  }
+
+  for (i = 0; i < LIT_SYMBOLS; i++)
+    freqLiterals[i] = 0;
+  for (i = 0; i < DIST_SYMBOLS; i++)
+    freqDistances[i] = 0;
+
+  i = 0;
+  while (i < lz77Size) {
+    n = lz77[i++] & 0xFFFF;
+    if (n < 257) {
+      freqLiterals[n]++;
+    }
+    else {
+      if (n > 285) {
+        fprintf(stderr, "main(): Bad length symbol %d.\n", n);
+        free(lz77);
+        return -1;
+      }
+      freqLiterals[n]++;
+      if (i >= lz77Size) {
+        fprintf(stderr, "main(): Truncated LZ77 pair.\n");
+        free(lz77);
+        return -1;
+      }
+      n = lz77[i++] & 0xFFFF;
+      if (n >= DIST_SYMBOLS) {
+        fprintf(stderr, "main(): Bad distance symbol %d.\n", n);
+        free(lz77);
+        return -1;
+      }
+      freqDistances[n]++;
+    }
+  }
+
+  if (huffmanBuildCodes(freqLiterals, LIT_SYMBOLS, codeLengthLiterals, codeLiterals) != 0 ||
+      huffmanBuildCodes(freqDistances, DIST_SYMBOLS, codeLengthDistances, codeDistances) != 0) {
+    fprintf(stderr, "main(): Failed to build Huffman codes.\n");
+    free(lz77);
+    return -1;
+  }
+
+  j = 0;
+  for (i = 0; i < LIT_SYMBOLS; i++)
+    codeLengths[j++] = codeLengthLiterals[i];
+  for (i = 0; i < DIST_SYMBOLS; i++)
+    codeLengths[j++] = codeLengthDistances[i];
+
+  codeLengthMax = 0;
+  for (i = 0; i < LENGTH_TOTAL; i++) {
+    if (codeLengthMax < codeLengths[i])
+      codeLengthMax = codeLengths[i];
+  }
+  codesN = codeLengthMax + 4;
+  if (codesN < 4 || codesN > 119) {
+    fprintf(stderr, "main(): Code-length alphabet size %d is unusable.\n", codesN);
+    free(lz77);
+    return -1;
+  }
+
+  if (rle_code_lengths(codeLengths, codeLengthMax, &codeLengthsN) != 0) {
+    free(lz77);
+    return -1;
+  }
+
   for (i = 0; i < codesN; i++)
     freqCombined[i] = 0;
 
-  /* calculate the frequencies */
-  i = 0;
-  while (i < codeLengthsN) {
-    /* plain data bytes, and the end marker */
-    freqCombined[codeLengths[i++] & 0xFFFF]++;
+  for (i = 0; i < codeLengthsN; i++) {
+    m = codeLengths[i] & 0xFFFF;
+    if (m < 0 || m >= codesN) {
+      fprintf(stderr, "main(): Code-length symbol %d is out of range.\n", m);
+      free(lz77);
+      return -1;
+    }
+    freqCombined[m]++;
   }
 
-  /* create the trees */
-  huffmanGrowTree(freqCombined, codesN, &treeCombined, codeLengthCombined, codeCombined);
-
-  /* rewrite the codes, so that the decoder can create them as well using the same code */
-  huffmanRecreateCodes(codesN, codeLengthCombined, codeCombined);
-
-  /********************************************************************************/
-  /* OUTPUT (DEF) */
-  /********************************************************************************/
-
-  /* write the DEF file */
-  f = fopen(argv[2], "wb");
-  if (f == NULL) {
-    fprintf(stderr, "main(): Could not open file \"%s\" for writing.\n", argv[2]);
-    return 1;
+  if (huffmanBuildCodes(freqCombined, codesN, codeLengthCombined, codeCombined) != 0) {
+    fprintf(stderr, "main(): Failed to build code-length Huffman codes.\n");
+    free(lz77);
+    return -1;
   }
 
-  /* header */
-  _write_u8(f, 'D');
-  _write_u8(f, 'E');
-  _write_u8(f, 'F');
-  _write_u8(f, 'c');
+  if (inputSize > INT_MAX - 64 || bitbuf_init(&bits, inputSize + 64) != 0) {
+    fprintf(stderr, "main(): Out of memory error.\n");
+    free(lz77);
+    return -1;
+  }
 
-  /* unpacked size */
-  _write_u32(f, fileSize);
+  if (bitbuf_byte(&bits, 'D') != 0 || bitbuf_byte(&bits, 'E') != 0 ||
+      bitbuf_byte(&bits, 'F') != 0 || bitbuf_byte(&bits, 'c') != 0 ||
+      bitbuf_byte(&bits, (unsigned char)(inputSize & 0xFF)) != 0 ||
+      bitbuf_byte(&bits, (unsigned char)((inputSize >> 8) & 0xFF)) != 0 ||
+      bitbuf_byte(&bits, (unsigned char)((inputSize >> 16) & 0xFF)) != 0 ||
+      bitbuf_byte(&bits, (unsigned char)((inputSize >> 24) & 0xFF)) != 0 ||
+      bitbuf_byte(&bits, (unsigned char)codesN) != 0) {
+    fprintf(stderr, "main(): Out of memory error.\n");
+    free(bits.data);
+    free(lz77);
+    return -1;
+  }
 
-  j = 0;
-  m = 0;
-
-  /* the number of code lengths */
-  _write_u8(f, codesN);
-
-  /* find the longest code */
   n = 0;
   for (i = 0; i < codesN; i++) {
     if (n < codeLengthCombined[i])
       n = codeLengthCombined[i];
   }
 
-  /* calculate the number of bits we need in order to write out the code length bits */
   if (n < 4)
     k = 2;
   else if (n < 8)
@@ -701,74 +584,133 @@ int main(int argc, char *argv[]) {
   else
     k = 7;
 
-  /* the number of bits per code length */
-  _write_bits(f, &j, &m, k, 3);
-
-  /* combined code lengths */
-  for (i = 0; i < codesN; i++) {
-    if (codeLengthCombined[i] > 115)
-      fprintf(stderr, "main(): Combined code length entry %d > 115!\n", codeLengthCombined[i]);
-    _write_bits(f, &j, &m, codeLengthCombined[i], k);
-    /*
-      fprintf(stderr, "main(): codeLengthCombined[%d] = %d\n", i, codeLengthCombined[i]);
-    */
+  if (bitbuf_bits(&bits, (unsigned int)k, 3) != 0) {
+    free(bits.data);
+    free(lz77);
+    return -1;
   }
 
-  /* compress combined code lengths */
-  i = 0;
-  while (i < codeLengthsN) {
+  for (i = 0; i < codesN; i++) {
+    if (codeLengthCombined[i] < 0 || codeLengthCombined[i] >= (1 << k)) {
+      fprintf(stderr, "main(): Combined code length entry %d does not fit in %d bits.\n",
+              codeLengthCombined[i], k);
+      free(bits.data);
+      free(lz77);
+      return -1;
+    }
+    if (bitbuf_bits(&bits, (unsigned int)codeLengthCombined[i], k) != 0) {
+      free(bits.data);
+      free(lz77);
+      return -1;
+    }
+  }
+
+  for (i = 0; i < codeLengthsN; i++) {
     n = codeLengths[i] & 0xFFFF;
-
-    _write_bits(f, &j, &m, codeCombined[n], codeLengthCombined[n]);
-
-    /*
-      fprintf(stderr, "i = %.3d: got %d\n", i, n);
-    */
-
-    /* extra bits? */
-    if (n > codeLengthMax) {
-      if (n == codeLengthMax + 1)
-        _write_bits(f, &j, &m, codeLengths[i] >> 16, 2);
-      else if (n == codeLengthMax + 2)
-        _write_bits(f, &j, &m, codeLengths[i] >> 16, 3);
-      else if (n == codeLengthMax + 3)
-        _write_bits(f, &j, &m, codeLengths[i] >> 16, 7);
-      else
-        fprintf(stderr, "main(): Internal error, combined code %d is not supported!\n", n);
-
-      /*
-        fprintf(stderr, "main(): n = %d\n", codeLengths[i] >> 16);
-      */
+    if (n < 0 || n >= codesN || codeLengthCombined[n] <= 0) {
+      fprintf(stderr, "main(): Cannot emit code-length symbol %d.\n", n);
+      free(bits.data);
+      free(lz77);
+      return -1;
+    }
+    if (bitbuf_bits(&bits, (unsigned int)codeCombined[n], codeLengthCombined[n]) != 0) {
+      free(bits.data);
+      free(lz77);
+      return -1;
     }
 
-    i++;
+    if (n > codeLengthMax) {
+      int extra, extraLen;
+
+      extra = codeLengths[i] >> 16;
+      if (n == codeLengthMax + 1)
+        extraLen = 2;
+      else if (n == codeLengthMax + 2)
+        extraLen = 3;
+      else if (n == codeLengthMax + 3)
+        extraLen = 7;
+      else {
+        fprintf(stderr, "main(): Internal error, combined code %d is not supported.\n", n);
+        free(bits.data);
+        free(lz77);
+        return -1;
+      }
+      if (extra < 0 || extra >= (1 << extraLen) ||
+          bitbuf_bits(&bits, (unsigned int)extra, extraLen) != 0) {
+        free(bits.data);
+        free(lz77);
+        return -1;
+      }
+    }
   }
 
-  /* compress payload */
   i = 0;
   while (i < lz77Size) {
-    n = lz77[i] & 0xFFFF;
+    int extra;
 
-    _write_bits(f, &j, &m, codeLiterals[n], codeLengthLiterals[n]);
+    n = lz77[i] & 0xFFFF;
+    if (n < 0 || n >= LIT_SYMBOLS || codeLengthLiterals[n] <= 0 ||
+        codeLiterals[n] < 0) {
+      fprintf(stderr, "main(): Cannot emit literal symbol %d.\n", n);
+      free(bits.data);
+      free(lz77);
+      return -1;
+    }
+    if (bitbuf_bits(&bits, (unsigned int)codeLiterals[n], codeLengthLiterals[n]) != 0) {
+      free(bits.data);
+      free(lz77);
+      return -1;
+    }
 
     if (n > 256) {
-      /* length extra bits */
+      if (n > 285) {
+        fprintf(stderr, "main(): Bad length symbol %d.\n", n);
+        free(bits.data);
+        free(lz77);
+        return -1;
+      }
       k = extraBitsLengths[n - 257];
       if (k > 0) {
-        n = lz77[i] >> 16;
-        _write_bits(f, &j, &m, n, k);
+        extra = lz77[i] >> 16;
+        if (extra < 0 || extra >= (1 << k) ||
+            bitbuf_bits(&bits, (unsigned int)extra, k) != 0) {
+          free(bits.data);
+          free(lz77);
+          return -1;
+        }
       }
       i++;
 
-      /* distance */
-      n = lz77[i] & 0xFFFF;
-      _write_bits(f, &j, &m, codeDistances[n], codeLengthDistances[n]);
+      if (i >= lz77Size) {
+        fprintf(stderr, "main(): Truncated LZ77 pair while writing.\n");
+        free(bits.data);
+        free(lz77);
+        return -1;
+      }
 
-      /* distance extra bits */
+      n = lz77[i] & 0xFFFF;
+      if (n < 0 || n >= DIST_SYMBOLS || codeLengthDistances[n] <= 0 ||
+          codeDistances[n] < 0) {
+        fprintf(stderr, "main(): Cannot emit distance symbol %d.\n", n);
+        free(bits.data);
+        free(lz77);
+        return -1;
+      }
+      if (bitbuf_bits(&bits, (unsigned int)codeDistances[n], codeLengthDistances[n]) != 0) {
+        free(bits.data);
+        free(lz77);
+        return -1;
+      }
+
       k = extraBitsDistances[n];
       if (k > 0) {
-        n = lz77[i] >> 16;
-        _write_bits(f, &j, &m, n, k);
+        extra = lz77[i] >> 16;
+        if (extra < 0 || extra >= (1 << k) ||
+            bitbuf_bits(&bits, (unsigned int)extra, k) != 0) {
+          free(bits.data);
+          free(lz77);
+          return -1;
+        }
       }
       i++;
     }
@@ -776,15 +718,112 @@ int main(int argc, char *argv[]) {
       i++;
   }
 
-  /* write out the last, remaining bits */
-  if (j != 0)
-    _write_u8(f, m << (8 - j));
+  if (bitbuf_finish(&bits) != 0) {
+    free(bits.data);
+    free(lz77);
+    return -1;
+  }
 
-  i = ftell(f);
+  free(lz77);
 
-  fclose(f);
-
-  fprintf(stderr, "main(): Original size = %dB, deflated size = %dB -> Got rid of %.2f%%.\n", fileSize, i, 100 - (i*100.0f / fileSize));
-
+  *output = bits.data;
+  *outputSize = bits.len;
   return 0;
 }
+
+
+#ifndef DEFLATE_LIBRARY
+int main(int argc, char *argv[]) {
+
+  int fileSize, outSize, matches, dupBytes;
+  long fileSizeLong;
+  unsigned char *data, *compressed;
+  FILE *f;
+
+  data = NULL;
+  compressed = NULL;
+
+  if (argc != 3) {
+    fprintf(stderr, "deflateTT v2.0 Written by Ville Helin 2007\n");
+    fprintf(stderr, "USAGE: %s <INPUT FILE> <OUTPUT FILE>\n", argv[0]);
+    return 1;
+  }
+
+  f = fopen(argv[1], "rb");
+  if (f == NULL) {
+    fprintf(stderr, "main(): Could not open file \"%s\" for reading.\n", argv[1]);
+    return 1;
+  }
+
+  if (fseek(f, 0, SEEK_END) != 0) {
+    fprintf(stderr, "main(): Could not seek in \"%s\".\n", argv[1]);
+    fclose(f);
+    return 1;
+  }
+  fileSizeLong = ftell(f);
+  if (fileSizeLong < 0 || fileSizeLong > (long)INT_MAX) {
+    fprintf(stderr, "main(): Unsupported file size in \"%s\".\n", argv[1]);
+    fclose(f);
+    return 1;
+  }
+  if (fseek(f, 0, SEEK_SET) != 0) {
+    fprintf(stderr, "main(): Could not seek in \"%s\".\n", argv[1]);
+    fclose(f);
+    return 1;
+  }
+  fileSize = (int)fileSizeLong;
+
+  data = (unsigned char *)malloc(fileSize > 0 ? fileSize : 1);
+  if (data == NULL) {
+    fprintf(stderr, "main(): Out of memory error.\n");
+    fclose(f);
+    return 1;
+  }
+
+  if (fileSize > 0 && (int)fread(data, 1, fileSize, f) != fileSize) {
+    fprintf(stderr, "main(): Could not read \"%s\".\n", argv[1]);
+    free(data);
+    fclose(f);
+    return 1;
+  }
+  fclose(f);
+
+  if (deflate_bytes(data, fileSize, &compressed, &outSize, &matches, &dupBytes) != 0) {
+    free(data);
+    return 1;
+  }
+
+  fprintf(stderr, "main(): LZ77: %d utilized matches | %d duplicate bytes.\n",
+          matches, dupBytes);
+
+  f = fopen(argv[2], "wb");
+  if (f == NULL) {
+    fprintf(stderr, "main(): Could not open file \"%s\" for writing.\n", argv[2]);
+    free(data);
+    free(compressed);
+    return 1;
+  }
+
+  if ((int)fwrite(compressed, 1, outSize, f) != outSize) {
+    fprintf(stderr, "main(): Could not write \"%s\".\n", argv[2]);
+    fclose(f);
+    free(data);
+    free(compressed);
+    return 1;
+  }
+  fclose(f);
+
+  if (fileSize == 0) {
+    fprintf(stderr, "main(): Original size = 0B, deflated size = %dB.\n", outSize);
+  }
+  else {
+    fprintf(stderr,
+            "main(): Original size = %dB, deflated size = %dB -> Got rid of %.2f%%.\n",
+            fileSize, outSize, 100.0 - (outSize * 100.0 / fileSize));
+  }
+
+  free(data);
+  free(compressed);
+  return 0;
+}
+#endif

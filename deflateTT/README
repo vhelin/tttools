@@ -7,20 +7,18 @@
 
 1. DESCRIPTION
 
-deflateTT is yet another commandline compressor that implements
-the deflate compression for deflate (RFC-1951). It's not done 100%
-according to the speficication, i.e. the header part is not like in the
-standard, but that shouldn't matter too much.
+deflateTT is a command-line compressor for the DEFc container.
+Literal, length and distance symbols follow RFC 1951. The bitstream
+does not: it is MSB-first, one block, with a custom code-length header.
+See the repository README for the layout. Stock zlib cannot read these
+files.
 
 The motivation behind writing this tool was to get a simple and
 efficient data compression utility that didn't depend on any libraries,
 like the pretty big and messy zlib, to my Nintendo DS homebrew projects.
 inflateTT is the decompression tool that can be used to decompress the
-files that have been compressed using deflateTT.
-
-See also the stand-alone project inflateTT-DS for a modified version of
-inflateTT that you can integrate to your Nintendo DS homebrew projects
-without a hassle.
+files that have been compressed using deflateTT. Nintendo DS projects
+compile inflateTT-MP/inflate_ds.c, which writes 16-bit words.
 
 
 2. CONTACT
@@ -31,8 +29,16 @@ vhelin#iki.fi.
 
 3. VERSION HISTORY
 
+v2.0 (10-Nov-2026)
+  * An empty alphabet and a one-symbol alphabet now get real one-bit
+    codes. Previously a file with no 3-byte match crashed, and a run of
+    identical bytes produced a DEFc file inflateTT could not read.
+  * Code lengths are limited to 15 bits.
+  * LZ77 uses a 3-byte hash chain and a 32768-byte window.
+  * Reads, writes and allocations are checked. Lengths are int.
+
 v1.21 (25-Feb-2010)
-  * Thanks to Carl ≈dahl for a bug fix. deflateTT would sometimes
+  * Thanks to Carl ùdahl for a bug fix. deflateTT would sometimes
     read past the end of 'data' buffer.
 
 v1.2 (06-May-2007)
