@@ -31,7 +31,7 @@ int main(int argc, char *argv[]) {
   f = NULL;
 
   if (argc != 3) {
-    fprintf(stderr, "inflateTT v2.0 Written by Ville Helin 2007\n");
+    fprintf(stderr, "inflateTT v2.1 Written by Ville Helin 2007\n");
     fprintf(stderr, "USAGE: %s <INPUT FILE> <OUTPUT FILE>\n", argv[0]);
     return 1;
   }
@@ -75,8 +75,8 @@ int main(int argc, char *argv[]) {
   fclose(f);
   f = NULL;
 
-  if (fileSize < 4 || data[0] != 'D' || data[1] != 'E' || data[2] != 'F' || data[3] != 'c') {
-    fprintf(stderr, "main(): File \"%s\" doesn't start with \"DEFc\".\n", argv[1]);
+  if (fileSize < 4 || data[0] != 'D' || data[1] != 'E' || data[2] != 'F' || data[3] != 'd') {
+    fprintf(stderr, "main(): File \"%s\" doesn't start with \"DEFd\".\n", argv[1]);
     free(data);
     return 1;
   }

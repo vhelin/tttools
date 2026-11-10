@@ -229,8 +229,8 @@ static void check_roundtrip(const char *name, const unsigned char *in, int n) {
     free(comp);
     return;
   }
-  if (comp[0] != 'D' || comp[1] != 'E' || comp[2] != 'F' || comp[3] != 'c')
-    fail(name, "missing DEFc magic");
+  if (comp[0] != 'D' || comp[1] != 'E' || comp[2] != 'F' || comp[3] != 'd')
+    fail(name, "missing DEFd magic");
   stored = (int)comp[4] | ((int)comp[5] << 8) |
            ((int)comp[6] << 16) | ((int)comp[7] << 24);
   if (stored != n)
@@ -349,7 +349,7 @@ static void check_errors(void) {
   if (rc != INFLATE_TRUNCATED)
     fail("empty input", "expected truncated");
 
-  rc = inflate((const unsigned char *)"DEFc", 4, out, 8, &produced, ctx);
+  rc = inflate((const unsigned char *)"DEFd", 4, out, 8, &produced, ctx);
   if (rc != INFLATE_TRUNCATED)
     fail("four byte header", "expected truncated");
 
@@ -609,7 +609,7 @@ static int build_bad_distance(unsigned char *data) {
   data[0] = 'D';
   data[1] = 'E';
   data[2] = 'F';
-  data[3] = 'c';
+  data[3] = 'd';
   data[4] = 0;
   data[5] = 0;
   data[6] = 0;
@@ -734,9 +734,9 @@ static void check_decoder_edges(void) {
   comp[6] = 0;
   comp[7] = 0;
   comp[8] = 0;
-  rc = inflate(comp, compSize, out, 4, &produced, ctx);
-  if (rc != INFLATE_BAD_CODE)
-    fail("codesN 0", "expected a bad code");
+  rc = inflate(comp, 9, out, 4, &produced, ctx);
+  if (rc != INFLATE_TRUNCATED)
+    fail("stored header", "expected truncated input");
 
   comp[8] = 3;
   rc = inflate(comp, compSize, out, 4, &produced, ctx);
@@ -751,7 +751,7 @@ static void check_decoder_edges(void) {
   crafted[0] = 'D';
   crafted[1] = 'E';
   crafted[2] = 'F';
-  crafted[3] = 'c';
+  crafted[3] = 'd';
   crafted[4] = 0;
   crafted[5] = 0;
   crafted[6] = 0;
@@ -993,6 +993,106 @@ static void check_long_lazy(void) {
 }
 
 
+static void fill_lcg(unsigned char *buf, int n, unsigned long seed);
+
+
+static void put_u32le(unsigned char *p, int n) {
+
+  p[0] = (unsigned char)(n & 0xFF);
+  p[1] = (unsigned char)((n >> 8) & 0xFF);
+  p[2] = (unsigned char)((n >> 16) & 0xFF);
+  p[3] = (unsigned char)((n >> 24) & 0xFF);
+}
+
+
+static void check_blocks(void) {
+
+  unsigned char *buf;
+  unsigned char *comp;
+  unsigned char raw[24];
+  unsigned char out[8];
+  struct InflateContext *ctx;
+  char why[80];
+  int i, compSize, rc, produced;
+
+  buf = (unsigned char *)malloc(16000);
+  ctx = (struct InflateContext *)malloc(sizeof(struct InflateContext));
+  if (buf == NULL || ctx == NULL) {
+    fail("blocks", "out of memory");
+    free(buf);
+    free(ctx);
+    return;
+  }
+
+  fill_lcg(buf, 2000, 7UL);
+  comp = NULL;
+  compSize = 0;
+  rc = deflate_bytes(buf, 2000, &comp, &compSize, NULL, NULL);
+  if (rc != 0 || comp == NULL || compSize > 2013) {
+    sprintf(why, "compressed to %d bytes", compSize);
+    fail("stored lcg", why);
+  }
+  free(comp);
+  check_roundtrip("stored lcg", buf, 2000);
+
+  for (i = 0; i < 8000; i++)
+    buf[i] = (unsigned char)(i % 20);
+  for (i = 8000; i < 16000; i++)
+    buf[i] = (unsigned char)(200 + (i % 20));
+  memcpy(buf + 8000, buf + 7800, 120);
+  comp = NULL;
+  compSize = 0;
+  rc = deflate_bytes(buf, 16000, &comp, &compSize, NULL, NULL);
+  if (rc != 0 || comp == NULL || compSize > 10000) {
+    sprintf(why, "compressed to %d bytes", compSize);
+    fail("split alphabets", why);
+  }
+  free(comp);
+  check_roundtrip("split alphabets", buf, 16000);
+
+  memset(raw, 0, 24);
+  raw[0] = 'D';
+  raw[1] = 'E';
+  raw[2] = 'F';
+  raw[3] = 'd';
+  raw[8] = 0;
+  put_u32le(raw + 4, 2);
+  put_u32le(raw + 9, 2);
+  raw[13] = 'A';
+  raw[14] = 'B';
+  produced = 0;
+  rc = inflate(raw, 15, out, 2, &produced, ctx);
+  if (rc != INFLATE_OK || produced != 2 || out[0] != 'A' || out[1] != 'B')
+    fail("stored block", "did not return the stored bytes");
+
+  put_u32le(raw + 4, 4);
+  put_u32le(raw + 9, 0);
+  rc = inflate(raw, 13, out, 4, &produced, ctx);
+  if (rc != INFLATE_BAD_CODE)
+    fail("stored length 0", "expected a bad code");
+
+  put_u32le(raw + 9, 5);
+  rc = inflate(raw, 13, out, 4, &produced, ctx);
+  if (rc != INFLATE_SIZE_MISMATCH)
+    fail("stored length past end", "expected a size mismatch");
+
+  put_u32le(raw + 9, 2);
+  raw[13] = 'A';
+  raw[14] = 'B';
+  rc = inflate(raw, 15, out, 4, &produced, ctx);
+  if (rc != INFLATE_SIZE_MISMATCH)
+    fail("stored then eof", "expected a size mismatch");
+
+  raw[15] = 2;
+  rc = inflate(raw, 16, out, 4, &produced, ctx);
+  if (rc != INFLATE_BAD_CODE)
+    fail("bad block type", "expected a bad code");
+
+  free(buf);
+  free(ctx);
+}
+
+
 static void fill_lcg(unsigned char *buf, int n, unsigned long seed) {
 
   int i;
@@ -1077,6 +1177,7 @@ int main(void) {
   check_window(buf);
   check_lazy_gain();
   check_long_lazy();
+  check_blocks();
   check_errors();
   check_decoder_edges();
 

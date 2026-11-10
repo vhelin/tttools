@@ -1,7 +1,8 @@
 /*
  * inflateTT-MP, decompresses data that has been compressed using deflateTT.
- * Literals, lengths and distances follow RFC 1951. The container is DEFc:
- * MSB-first bits, one block, custom code-length header.
+ * Literals, lengths and distances follow RFC 1951. The container is DEFd:
+ * MSB-first bits, one or more blocks, custom code-length header.
+ * A block is Huffman-coded or stored. The window crosses blocks.
  *
  * Programmed by Ville Helin <vhelin#iki.fi> in 2007.
  * Bounds checks and the 16-bit writer entry point were tightened in 2026.
@@ -286,49 +287,18 @@ static unsigned long read_u32le(const unsigned char *p) {
 }
 
 
-static int inflate_stream(const unsigned char *data, int dataSize,
-                          struct sink *out, int *outputSize,
-                          struct InflateContext *context) {
+/* Huffman block. reader is positioned at bit 7 of the first bitstream
+   byte. codesN is 4..119. Symbol 256 ends the block. */
+static int inflate_huffman_block(struct bitreader *reader,
+                                 struct InflateContext *context,
+                                 struct sink *out, int codesN) {
 
-  struct bitreader reader;
-  unsigned long claimedLong;
-  int claimed;
-  int j, n, m, b, e, length, distance, codesN, bPrevious, rc, sym;
+  int j, n, m, b, e, length, distance, bPrevious, rc, sym;
 
-  if (outputSize != NULL)
-    *outputSize = 0;
-
-  if (data == NULL || context == NULL || out == NULL || dataSize < 0)
-    return INFLATE_BAD_ARGUMENT;
-  if (out->bytes == NULL && out->vram == NULL && out->cap != 0)
-    return INFLATE_BAD_ARGUMENT;
-
-  if (dataSize < 4)
-    return INFLATE_TRUNCATED;
-  if (data[0] != 'D' || data[1] != 'E' || data[2] != 'F' || data[3] != 'c')
-    return INFLATE_WRONG_HEADER;
-  if (dataSize < 9)
-    return INFLATE_TRUNCATED;
-
-  claimedLong = read_u32le(data + 4);
-  if (claimedLong > (unsigned long)INT_MAX)
-    return INFLATE_OUTPUT_OVERFLOW;
-  claimed = (int)claimedLong;
-  if (claimed > out->cap)
-    return INFLATE_OUTPUT_OVERFLOW;
-  out->cap = claimed;
-  out->n = 0;
-
-  codesN = data[8];
   if (codesN < 4 || codesN > INFLATE_CODELEN_SYMBOLS)
     return INFLATE_BAD_CODE;
 
-  reader.data = data;
-  reader.size = dataSize;
-  reader.index = 9;
-  reader.bit = 7;
-
-  if (bit_getn(&reader, 3, &m) != 0)
+  if (bit_getn(reader, 3, &m) != 0)
     return INFLATE_TRUNCATED;
   if (m < 1 || m > INFLATE_MAX_BITS)
     return INFLATE_BAD_CODE;
@@ -336,7 +306,7 @@ static int inflate_stream(const unsigned char *data, int dataSize,
   for (j = 0; j < codesN; j++) {
     context->codeLengthCombined[j] = 0;
     for (n = 0; n < m; n++) {
-      if (bit_get(&reader, &b) != 0)
+      if (bit_get(reader, &b) != 0)
         return INFLATE_TRUNCATED;
       context->codeLengthCombined[j] = (context->codeLengthCombined[j] << 1) | b;
     }
@@ -365,7 +335,7 @@ static int inflate_stream(const unsigned char *data, int dataSize,
   while (j < INFLATE_LIT_SYMBOLS + INFLATE_DIST_SYMBOLS) {
     int count, value;
 
-    rc = decode_symbol(&reader, context->treeCombined, &sym);
+    rc = decode_symbol(reader, context->treeCombined, &sym);
     if (rc != INFLATE_OK)
       return rc;
     if (sym < 0 || sym >= codesN)
@@ -378,19 +348,19 @@ static int inflate_stream(const unsigned char *data, int dataSize,
       count = 1;
     }
     else if (sym == codesN - 3) {
-      if (bit_getn(&reader, 2, &e) != 0)
+      if (bit_getn(reader, 2, &e) != 0)
         return INFLATE_TRUNCATED;
       count = e + 3;
       value = bPrevious;
     }
     else if (sym == codesN - 2) {
-      if (bit_getn(&reader, 3, &e) != 0)
+      if (bit_getn(reader, 3, &e) != 0)
         return INFLATE_TRUNCATED;
       count = e + 3;
       value = 0;
     }
     else if (sym == codesN - 1) {
-      if (bit_getn(&reader, 7, &e) != 0)
+      if (bit_getn(reader, 7, &e) != 0)
         return INFLATE_TRUNCATED;
       count = e + 11;
       value = 0;
@@ -431,7 +401,7 @@ static int inflate_stream(const unsigned char *data, int dataSize,
     int src;
     int t;
 
-    rc = decode_symbol(&reader, context->treeLiterals, &sym);
+    rc = decode_symbol(reader, context->treeLiterals, &sym);
     if (rc != INFLATE_OK)
       return rc;
 
@@ -450,14 +420,14 @@ static int inflate_stream(const unsigned char *data, int dataSize,
     b = sym - 257;
     length = baseValueLengths[b];
     if (extraBitsLengths[b] > 0) {
-      if (bit_getn(&reader, extraBitsLengths[b], &e) != 0)
+      if (bit_getn(reader, extraBitsLengths[b], &e) != 0)
         return INFLATE_TRUNCATED;
       length += e;
     }
     if (length < 3 || length > 258)
       return INFLATE_BAD_CODE;
 
-    rc = decode_symbol(&reader, context->treeDistances, &sym);
+    rc = decode_symbol(reader, context->treeDistances, &sym);
     if (rc != INFLATE_OK)
       return rc;
     if (sym < 0 || sym > 29)
@@ -465,7 +435,7 @@ static int inflate_stream(const unsigned char *data, int dataSize,
 
     distance = baseValueDistances[sym];
     if (extraBitsDistances[sym] > 0) {
-      if (bit_getn(&reader, extraBitsDistances[sym], &e) != 0)
+      if (bit_getn(reader, extraBitsDistances[sym], &e) != 0)
         return INFLATE_TRUNCATED;
       distance += e;
     }
@@ -483,6 +453,101 @@ static int inflate_stream(const unsigned char *data, int dataSize,
       if (sink_put(out, byte) != 0)
         return INFLATE_SIZE_MISMATCH;
     }
+  }
+
+  return INFLATE_OK;
+}
+
+
+/* Stored block at data[pos]: uint32 little-endian length, then raw bytes.
+   The length is at least 1 and must fit in the bytes still owed. */
+static int inflate_stored(const unsigned char *data, int dataSize, int pos,
+                          struct sink *out, int claimed, int *nextPos) {
+
+  unsigned long lengthLong;
+  int length, i;
+
+  if (pos < 0 || dataSize < 4 || pos > dataSize - 4)
+    return INFLATE_TRUNCATED;
+
+  lengthLong = read_u32le(data + pos);
+  if (lengthLong == 0 || lengthLong > (unsigned long)INT_MAX)
+    return INFLATE_BAD_CODE;
+  length = (int)lengthLong;
+  if (out->n > claimed || length > claimed - out->n)
+    return INFLATE_SIZE_MISMATCH;
+  if (length > dataSize - (pos + 4))
+    return INFLATE_TRUNCATED;
+
+  for (i = 0; i < length; i++) {
+    if (sink_put(out, data[pos + 4 + i]) != 0)
+      return INFLATE_SIZE_MISMATCH;
+  }
+  *nextPos = pos + 4 + length;
+  return INFLATE_OK;
+}
+
+
+static int inflate_stream(const unsigned char *data, int dataSize,
+                          struct sink *out, int *outputSize,
+                          struct InflateContext *context) {
+
+  struct bitreader reader;
+  unsigned long claimedLong;
+  int claimed, pos, type, before, rc;
+
+  if (outputSize != NULL)
+    *outputSize = 0;
+
+  if (data == NULL || context == NULL || out == NULL || dataSize < 0)
+    return INFLATE_BAD_ARGUMENT;
+  if (out->bytes == NULL && out->vram == NULL && out->cap != 0)
+    return INFLATE_BAD_ARGUMENT;
+
+  if (dataSize < 4)
+    return INFLATE_TRUNCATED;
+  if (data[0] != 'D' || data[1] != 'E' || data[2] != 'F' || data[3] != 'd')
+    return INFLATE_WRONG_HEADER;
+  if (dataSize < 9)
+    return INFLATE_TRUNCATED;
+
+  claimedLong = read_u32le(data + 4);
+  if (claimedLong > (unsigned long)INT_MAX)
+    return INFLATE_OUTPUT_OVERFLOW;
+  claimed = (int)claimedLong;
+  if (claimed > out->cap)
+    return INFLATE_OUTPUT_OVERFLOW;
+  out->cap = claimed;
+  out->n = 0;
+
+  pos = 8;
+  for (;;) {
+    if (pos < 0 || pos >= dataSize)
+      return INFLATE_SIZE_MISMATCH;
+    type = data[pos];
+    before = out->n;
+    if (type == 0) {
+      rc = inflate_stored(data, dataSize, pos + 1, out, claimed, &pos);
+      if (rc != INFLATE_OK)
+        return rc;
+    }
+    else if (type >= 4 && type <= INFLATE_CODELEN_SYMBOLS) {
+      reader.data = data;
+      reader.size = dataSize;
+      reader.index = pos + 1;
+      reader.bit = 7;
+      rc = inflate_huffman_block(&reader, context, out, type);
+      if (rc != INFLATE_OK)
+        return rc;
+      pos = reader.index + 1;
+    }
+    else
+      return INFLATE_BAD_CODE;
+
+    if (out->n >= claimed)
+      break;
+    if (out->n == before)
+      return INFLATE_BAD_CODE;
   }
 
   if (out->n != claimed)

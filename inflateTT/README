@@ -7,7 +7,7 @@
 
 1. DESCRIPTION
 
-inflateTT is a command-line decompressor for DEFc files written by
+inflateTT is a command-line decompressor for DEFd files written by
 deflateTT. It is a file-I/O wrapper around inflateTT-MP. See the
 repository README for the bitstream, which is not a zlib stream.
 
@@ -28,6 +28,10 @@ vhelin#iki.fi.
 
 
 3. VERSION HISTORY
+
+v2.1 (10-Nov-2026)
+  * Reads the "DEFd" multi-block and stored-block files written by
+    deflateTT 2.3.
 
 v2.0 (10-Nov-2026)
   * Uses inflateTT-MP. Truncated, oversized and inconsistent input

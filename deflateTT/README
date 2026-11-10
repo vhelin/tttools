@@ -7,7 +7,7 @@
 
 1. DESCRIPTION
 
-deflateTT is a command-line compressor for the DEFc container.
+deflateTT is a command-line compressor for the DEFd container.
 Literal, length and distance symbols follow RFC 1951. The bitstream
 does not: it is MSB-first, one block, with a custom code-length header.
 See the repository README for the layout. Stock zlib cannot read these
@@ -28,6 +28,12 @@ vhelin#iki.fi.
 
 
 3. VERSION HISTORY
+
+v2.3 (10-Nov-2026)
+  * A file may contain several Huffman blocks, and a block may be
+    stored uncompressed. A match can still refer to an earlier block.
+    One block is kept when that is smaller.
+  * Creates now "DEFd" files instead of "DEFc".
 
 v2.2 (10-Nov-2026)
   * Lazy matching looks one byte ahead for every match, up to the

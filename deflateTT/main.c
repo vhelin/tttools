@@ -1,8 +1,9 @@
 /*
  * deflateTT, compresses data that can be uncompressed using inflateTT.
  * Literals, lengths and distances follow RFC 1951. The container is the
- * DEFc format described in the repository README: MSB-first bits, one
- * block, and a custom code-length header.
+ * DEFd format described in the repository README: MSB-first bits, one
+ * or more Huffman or stored blocks, and a custom code-length header.
+ * The window crosses blocks.
  *
  * Programmed by Ville Helin <vhelin#iki.fi> in 2007.
  * Hash-chained LZ77, 15-bit Huffman limits and I/O checks added in 2026.
@@ -148,9 +149,28 @@ static int bitbuf_bits(struct bitbuf *b, unsigned int code, int codeLength) {
 
 static int bitbuf_finish(struct bitbuf *b) {
 
+  int rc;
+
   if (b->nbits == 0)
     return 0;
-  return bitbuf_byte(b, (unsigned char)(b->acc << (8 - b->nbits)));
+  rc = bitbuf_byte(b, (unsigned char)(b->acc << (8 - b->nbits)));
+  b->acc = 0;
+  b->nbits = 0;
+  return rc;
+}
+
+
+static int bitbuf_bytes(struct bitbuf *b, const unsigned char *bytes, int n) {
+
+  int i;
+
+  if (b->nbits != 0 || n < 0)
+    return -1;
+  if (bitbuf_grow(b, n) != 0)
+    return -1;
+  for (i = 0; i < n; i++)
+    b->data[b->len++] = bytes[i];
+  return 0;
 }
 
 
@@ -445,20 +465,587 @@ static int rle_code_lengths(int *lengths, int codeLengthMax, int *outCount) {
 }
 
 
+/* Output bytes covered by one preprocessed LZ77 token. Distances are skipped. */
+static int span_bytes(const int *lz77, int lz77Size, int i, int *step) {
+
+  int sym, extra, j;
+
+  if (i < 0 || i >= lz77Size)
+    return -1;
+
+  sym = lz77[i] & 0xFFFF;
+  extra = lz77[i] >> 16;
+  if (extra < 0)
+    return -1;
+
+  if (sym < 256) {
+    *step = 1;
+    return 1;
+  }
+  if (sym == 256) {
+    *step = 1;
+    return 0;
+  }
+  if (sym > 285 || i + 1 >= lz77Size)
+    return -1;
+
+  *step = 2;
+  if (sym <= 264)
+    return sym - 254;
+  if (sym == 285)
+    return 258;
+  j = sym - 265;
+  if (j < 0 || j >= 20)
+    return -1;
+  return extraBitsLimitsLength[j] + extra;
+}
+
+
+/* Huffman-encode tokens [begin, end) and an end-of-block symbol.
+   The block starts with the code-length alphabet size, on a byte boundary. */
+static int emit_huffman_range(struct bitbuf *bits, const int *lz77, int begin, int end) {
+
+  int i, j, k, m, n;
+  int codeLengthMax, codesN, codeLengthsN;
+
+  if (bits->nbits != 0 || begin < 0 || end < begin)
+    return -1;
+
+  for (i = 0; i < LIT_SYMBOLS; i++)
+    freqLiterals[i] = 0;
+  for (i = 0; i < DIST_SYMBOLS; i++)
+    freqDistances[i] = 0;
+  freqLiterals[256]++;
+
+  i = begin;
+  while (i < end) {
+    n = lz77[i++] & 0xFFFF;
+    if (n < 257) {
+      freqLiterals[n]++;
+    }
+    else {
+      if (n > 285) {
+        fprintf(stderr, "main(): Bad length symbol %d.\n", n);
+        return -1;
+      }
+      freqLiterals[n]++;
+      if (i >= end) {
+        fprintf(stderr, "main(): Truncated LZ77 pair.\n");
+        return -1;
+      }
+      n = lz77[i++] & 0xFFFF;
+      if (n >= DIST_SYMBOLS) {
+        fprintf(stderr, "main(): Bad distance symbol %d.\n", n);
+        return -1;
+      }
+      freqDistances[n]++;
+    }
+  }
+
+  if (huffmanBuildCodes(freqLiterals, LIT_SYMBOLS, codeLengthLiterals, codeLiterals) != 0 ||
+      huffmanBuildCodes(freqDistances, DIST_SYMBOLS, codeLengthDistances, codeDistances) != 0) {
+    fprintf(stderr, "main(): Failed to build Huffman codes.\n");
+    return -1;
+  }
+
+  j = 0;
+  for (i = 0; i < LIT_SYMBOLS; i++)
+    codeLengths[j++] = codeLengthLiterals[i];
+  for (i = 0; i < DIST_SYMBOLS; i++)
+    codeLengths[j++] = codeLengthDistances[i];
+
+  codeLengthMax = 0;
+  for (i = 0; i < LENGTH_TOTAL; i++) {
+    if (codeLengthMax < codeLengths[i])
+      codeLengthMax = codeLengths[i];
+  }
+  codesN = codeLengthMax + 4;
+  if (codesN < 4 || codesN > 119) {
+    fprintf(stderr, "main(): Code-length alphabet size %d is unusable.\n", codesN);
+    return -1;
+  }
+
+  if (rle_code_lengths(codeLengths, codeLengthMax, &codeLengthsN) != 0)
+    return -1;
+
+  for (i = 0; i < codesN; i++)
+    freqCombined[i] = 0;
+
+  for (i = 0; i < codeLengthsN; i++) {
+    m = codeLengths[i] & 0xFFFF;
+    if (m < 0 || m >= codesN) {
+      fprintf(stderr, "main(): Code-length symbol %d is out of range.\n", m);
+      return -1;
+    }
+    freqCombined[m]++;
+  }
+
+  if (huffmanBuildCodes(freqCombined, codesN, codeLengthCombined, codeCombined) != 0) {
+    fprintf(stderr, "main(): Failed to build code-length Huffman codes.\n");
+    return -1;
+  }
+
+  if (bitbuf_byte(bits, (unsigned char)codesN) != 0)
+    return -1;
+
+  n = 0;
+  for (i = 0; i < codesN; i++) {
+    if (n < codeLengthCombined[i])
+      n = codeLengthCombined[i];
+  }
+
+  if (n < 4)
+    k = 2;
+  else if (n < 8)
+    k = 3;
+  else if (n < 16)
+    k = 4;
+  else if (n < 32)
+    k = 5;
+  else if (n < 64)
+    k = 6;
+  else
+    k = 7;
+
+  if (bitbuf_bits(bits, (unsigned int)k, 3) != 0)
+    return -1;
+
+  for (i = 0; i < codesN; i++) {
+    if (codeLengthCombined[i] < 0 || codeLengthCombined[i] >= (1 << k)) {
+      fprintf(stderr, "main(): Combined code length entry %d does not fit in %d bits.\n",
+              codeLengthCombined[i], k);
+      return -1;
+    }
+    if (bitbuf_bits(bits, (unsigned int)codeLengthCombined[i], k) != 0)
+      return -1;
+  }
+
+  for (i = 0; i < codeLengthsN; i++) {
+    int extra, extraLen;
+
+    n = codeLengths[i] & 0xFFFF;
+    if (n < 0 || n >= codesN || codeLengthCombined[n] <= 0) {
+      fprintf(stderr, "main(): Cannot emit code-length symbol %d.\n", n);
+      return -1;
+    }
+    if (bitbuf_bits(bits, (unsigned int)codeCombined[n], codeLengthCombined[n]) != 0)
+      return -1;
+
+    if (n > codeLengthMax) {
+      extra = codeLengths[i] >> 16;
+      if (n == codeLengthMax + 1)
+        extraLen = 2;
+      else if (n == codeLengthMax + 2)
+        extraLen = 3;
+      else if (n == codeLengthMax + 3)
+        extraLen = 7;
+      else {
+        fprintf(stderr, "main(): Internal error, combined code %d is not supported.\n", n);
+        return -1;
+      }
+      if (extra < 0 || extra >= (1 << extraLen) ||
+          bitbuf_bits(bits, (unsigned int)extra, extraLen) != 0)
+        return -1;
+    }
+  }
+
+  i = begin;
+  while (i < end) {
+    int extra;
+
+    n = lz77[i] & 0xFFFF;
+    if (n < 0 || n >= LIT_SYMBOLS || codeLengthLiterals[n] <= 0 ||
+        codeLiterals[n] < 0) {
+      fprintf(stderr, "main(): Cannot emit literal symbol %d.\n", n);
+      return -1;
+    }
+    if (bitbuf_bits(bits, (unsigned int)codeLiterals[n], codeLengthLiterals[n]) != 0)
+      return -1;
+
+    if (n > 256) {
+      if (n > 285) {
+        fprintf(stderr, "main(): Bad length symbol %d.\n", n);
+        return -1;
+      }
+      k = extraBitsLengths[n - 257];
+      if (k > 0) {
+        extra = lz77[i] >> 16;
+        if (extra < 0 || extra >= (1 << k) ||
+            bitbuf_bits(bits, (unsigned int)extra, k) != 0)
+          return -1;
+      }
+      i++;
+
+      if (i >= end) {
+        fprintf(stderr, "main(): Truncated LZ77 pair while writing.\n");
+        return -1;
+      }
+
+      n = lz77[i] & 0xFFFF;
+      if (n < 0 || n >= DIST_SYMBOLS || codeLengthDistances[n] <= 0 ||
+          codeDistances[n] < 0) {
+        fprintf(stderr, "main(): Cannot emit distance symbol %d.\n", n);
+        return -1;
+      }
+      if (bitbuf_bits(bits, (unsigned int)codeDistances[n], codeLengthDistances[n]) != 0)
+        return -1;
+
+      k = extraBitsDistances[n];
+      if (k > 0) {
+        extra = lz77[i] >> 16;
+        if (extra < 0 || extra >= (1 << k) ||
+            bitbuf_bits(bits, (unsigned int)extra, k) != 0)
+          return -1;
+      }
+      i++;
+    }
+    else
+      i++;
+  }
+
+  n = 256;
+  if (codeLengthLiterals[n] <= 0 || codeLiterals[n] < 0) {
+    fprintf(stderr, "main(): Cannot emit literal symbol %d.\n", n);
+    return -1;
+  }
+  if (bitbuf_bits(bits, (unsigned int)codeLiterals[n], codeLengthLiterals[n]) != 0)
+    return -1;
+  return bitbuf_finish(bits);
+}
+
+
+static int emit_stored(struct bitbuf *bits, const unsigned char *raw, int n) {
+
+  if (bits->nbits != 0 || n < 1)
+    return -1;
+  if (bitbuf_byte(bits, 0) != 0 ||
+      bitbuf_byte(bits, (unsigned char)(n & 0xFF)) != 0 ||
+      bitbuf_byte(bits, (unsigned char)((n >> 8) & 0xFF)) != 0 ||
+      bitbuf_byte(bits, (unsigned char)((n >> 16) & 0xFF)) != 0 ||
+      bitbuf_byte(bits, (unsigned char)((n >> 24) & 0xFF)) != 0)
+    return -1;
+  return bitbuf_bytes(bits, raw, n);
+}
+
+
+static int huffman_cost(const int *lz77, int tok0, int tok1, int rawLen) {
+
+  struct bitbuf bits;
+  int rc, n, cap;
+
+  if (rawLen < 0 || rawLen > INT_MAX - 64)
+    return -1;
+  cap = rawLen + 64;
+  if (bitbuf_init(&bits, cap) != 0)
+    return -1;
+  rc = emit_huffman_range(&bits, lz77, tok0, tok1);
+  n = bits.len;
+  free(bits.data);
+  if (rc != 0)
+    return -1;
+  return n;
+}
+
+
+static int build_bounds(const int *lz77, int lz77Size, int inputSize,
+                        int *tokAt, int *byteAt, int *nboundsOut) {
+
+  int i, step, bytes, pos, nbounds;
+
+  nbounds = 0;
+  tokAt[nbounds] = 0;
+  byteAt[nbounds] = 0;
+  nbounds++;
+
+  i = 0;
+  pos = 0;
+  while (i < lz77Size && (lz77[i] & 0xFFFF) != 256) {
+    bytes = span_bytes(lz77, lz77Size, i, &step);
+    if (bytes < 0 || step < 1 || pos > inputSize - bytes)
+      return -1;
+    i += step;
+    pos += bytes;
+    if (nbounds >= lz77Size)
+      return -1;
+    tokAt[nbounds] = i;
+    byteAt[nbounds] = pos;
+    nbounds++;
+  }
+
+  if (i >= lz77Size || (lz77[i] & 0xFFFF) != 256 || pos != inputSize) {
+    fprintf(stderr, "main(): LZ77 token stream does not cover the input.\n");
+    return -1;
+  }
+  *nboundsOut = nbounds;
+  return 0;
+}
+
+
+static int histogram_score(const unsigned char *data, int n, int pos, int window) {
+
+  int a[256], b[256];
+  int i, d, score;
+
+  if (window < 1 || pos < window || pos > n - window)
+    return 0;
+  for (i = 0; i < 256; i++) {
+    a[i] = 0;
+    b[i] = 0;
+  }
+  for (i = pos - window; i < pos; i++)
+    a[data[i]]++;
+  for (i = pos; i < pos + window; i++)
+    b[data[i]]++;
+  score = 0;
+  for (i = 0; i < 256; i++) {
+    d = a[i] - b[i];
+    if (d < 0)
+      d = -d;
+    score += d;
+  }
+  return score;
+}
+
+
+/* Up to two byte positions where the neighbouring histograms disagree.
+   A shift has to be stronger than one count per symbol in the window,
+   and the two positions have to be at least one window apart. */
+static void find_splits(const unsigned char *data, int n, int *s0, int *s1, int *nfound) {
+
+  int window, step, pos, score, best1, best2, score1, score2, gap, have;
+
+  *nfound = 0;
+  *s0 = 0;
+  *s1 = 0;
+  if (n < 4096)
+    return;
+
+  window = 1024;
+  step = 256;
+  best1 = 0;
+  best2 = 0;
+  score1 = 0;
+  score2 = 0;
+  have = 0;
+
+  for (pos = window; pos <= n - window; pos += step) {
+    score = histogram_score(data, n, pos, window);
+    if (score <= window)
+      continue;
+    if (have == 0 || score > score1) {
+      if (have >= 1) {
+        gap = pos - best1;
+        if (gap < 0)
+          gap = -gap;
+        if (gap >= window) {
+          best2 = best1;
+          score2 = score1;
+          have = 2;
+        }
+      }
+      best1 = pos;
+      score1 = score;
+      if (have == 0)
+        have = 1;
+      else if (have == 2) {
+        gap = best2 - best1;
+        if (gap < 0)
+          gap = -gap;
+        if (gap < window)
+          have = 1;
+      }
+    }
+    else {
+      gap = pos - best1;
+      if (gap < 0)
+        gap = -gap;
+      if (gap >= window && score > score2) {
+        best2 = pos;
+        score2 = score;
+        have = 2;
+      }
+    }
+  }
+
+  if (have >= 1) {
+    *s0 = best1;
+    *nfound = 1;
+  }
+  if (have >= 2) {
+    *s1 = best2;
+    *nfound = 2;
+  }
+}
+
+
+static int snap_bound(const int *byteAt, int nbounds, int target) {
+
+  int i, best, dist, bestd;
+
+  if (nbounds < 3)
+    return -1;
+  best = -1;
+  bestd = 0;
+  for (i = 1; i < nbounds - 1; i++) {
+    dist = byteAt[i] - target;
+    if (dist < 0)
+      dist = -dist;
+    if (best < 0 || dist < bestd) {
+      best = i;
+      bestd = dist;
+    }
+  }
+  return best;
+}
+
+
+struct blockseg {
+  int tok0;
+  int tok1;
+  int byte0;
+  int byte1;
+  int stored;
+};
+
+
+static int segment_choice(const int *lz77, int tok0, int tok1,
+                          int byte0, int byte1, int *storedOut, int *costOut) {
+
+  int raw, storedCost, huff;
+
+  raw = byte1 - byte0;
+  if (raw < 0 || tok0 > tok1)
+    return -1;
+  huff = huffman_cost(lz77, tok0, tok1, raw > 0 ? raw : 0);
+  if (huff < 0)
+    return -1;
+  if (raw > 0 && raw <= INT_MAX - 5) {
+    storedCost = 5 + raw;
+    if (storedCost < huff) {
+      *storedOut = 1;
+      *costOut = storedCost;
+      return 0;
+    }
+  }
+  *storedOut = 0;
+  *costOut = huff;
+  return 0;
+}
+
+
+static int consider_blocks(const int *lz77, const int *tokAt, const int *byteAt,
+                           int i0, int i1, int i2, int i3, int nparts,
+                           struct blockseg *best, int *bestN, int *bestCost) {
+
+  struct blockseg part[3];
+  int idx[4];
+  int p, total, stored, partCost, raw;
+
+  idx[0] = i0;
+  idx[1] = i1;
+  idx[2] = i2;
+  idx[3] = i3;
+  total = 0;
+  for (p = 0; p < nparts; p++) {
+    raw = byteAt[idx[p + 1]] - byteAt[idx[p]];
+    if (raw == 0 && nparts > 1)
+      return 0;
+    if (segment_choice(lz77, tokAt[idx[p]], tokAt[idx[p + 1]],
+                       byteAt[idx[p]], byteAt[idx[p + 1]],
+                       &stored, &partCost) != 0)
+      return -1;
+    if (partCost < 0 || partCost > INT_MAX - total)
+      return -1;
+    total += partCost;
+    part[p].tok0 = tokAt[idx[p]];
+    part[p].tok1 = tokAt[idx[p + 1]];
+    part[p].byte0 = byteAt[idx[p]];
+    part[p].byte1 = byteAt[idx[p + 1]];
+    part[p].stored = stored;
+  }
+  if (total < *bestCost) {
+    *bestCost = total;
+    *bestN = nparts;
+    for (p = 0; p < nparts; p++)
+      best[p] = part[p];
+  }
+  return 0;
+}
+
+
+static int plan_blocks(const unsigned char *input, int inputSize,
+                       const int *lz77, const int *tokAt, const int *byteAt,
+                       int nbounds, struct blockseg *plan, int *planCount) {
+
+  struct blockseg best[3];
+  int bestN, bestCost, nf, s0, s1, a, b, lo, hi;
+
+  bestN = 0;
+  bestCost = INT_MAX;
+  a = -1;
+  b = -1;
+  if (consider_blocks(lz77, tokAt, byteAt, 0, nbounds - 1, 0, 0, 1,
+                      best, &bestN, &bestCost) != 0)
+    return -1;
+
+  find_splits(input, inputSize, &s0, &s1, &nf);
+  if (nf >= 1) {
+    a = snap_bound(byteAt, nbounds, s0);
+    if (a > 0 &&
+        consider_blocks(lz77, tokAt, byteAt, 0, a, nbounds - 1, 0, 2,
+                        best, &bestN, &bestCost) != 0)
+      return -1;
+  }
+  if (nf >= 2) {
+    b = snap_bound(byteAt, nbounds, s1);
+    if (b > 0 && b != a &&
+        consider_blocks(lz77, tokAt, byteAt, 0, b, nbounds - 1, 0, 2,
+                        best, &bestN, &bestCost) != 0)
+      return -1;
+    if (a > 0 && b > 0 && a != b) {
+      if (a < b) {
+        lo = a;
+        hi = b;
+      }
+      else {
+        lo = b;
+        hi = a;
+      }
+      if (consider_blocks(lz77, tokAt, byteAt, 0, lo, hi, nbounds - 1, 3,
+                          best, &bestN, &bestCost) != 0)
+        return -1;
+    }
+  }
+
+  if (bestN < 1)
+    return -1;
+  for (lo = 0; lo < bestN; lo++)
+    plan[lo] = best[lo];
+  *planCount = bestN;
+  return 0;
+}
+
+
 int deflate_bytes(const unsigned char *input, int inputSize,
                   unsigned char **output, int *outputSize,
                   int *matches, int *duplicateBytes) {
 
   int *lz77;
-  int lz77Size, i, j, k, m, n;
-  int codeLengthMax, codesN, codeLengthsN;
+  int *tokAt;
+  int *byteAt;
+  struct blockseg segs[3];
+  int lz77Size, i, nbounds, nsegs;
   int matchCount, dupBytes, allocCount;
   struct bitbuf bits;
 
   lz77 = NULL;
+  tokAt = NULL;
+  byteAt = NULL;
   bits.data = NULL;
   matchCount = 0;
   dupBytes = 0;
+  nbounds = 0;
+  nsegs = 0;
 
   if (output == NULL || outputSize == NULL)
     return -1;
@@ -505,272 +1092,75 @@ int deflate_bytes(const unsigned char *input, int inputSize,
     return -1;
   }
 
-  for (i = 0; i < LIT_SYMBOLS; i++)
-    freqLiterals[i] = 0;
-  for (i = 0; i < DIST_SYMBOLS; i++)
-    freqDistances[i] = 0;
-
-  i = 0;
-  while (i < lz77Size) {
-    n = lz77[i++] & 0xFFFF;
-    if (n < 257) {
-      freqLiterals[n]++;
-    }
-    else {
-      if (n > 285) {
-        fprintf(stderr, "main(): Bad length symbol %d.\n", n);
-        free(lz77);
-        return -1;
-      }
-      freqLiterals[n]++;
-      if (i >= lz77Size) {
-        fprintf(stderr, "main(): Truncated LZ77 pair.\n");
-        free(lz77);
-        return -1;
-      }
-      n = lz77[i++] & 0xFFFF;
-      if (n >= DIST_SYMBOLS) {
-        fprintf(stderr, "main(): Bad distance symbol %d.\n", n);
-        free(lz77);
-        return -1;
-      }
-      freqDistances[n]++;
-    }
-  }
-
-  if (huffmanBuildCodes(freqLiterals, LIT_SYMBOLS, codeLengthLiterals, codeLiterals) != 0 ||
-      huffmanBuildCodes(freqDistances, DIST_SYMBOLS, codeLengthDistances, codeDistances) != 0) {
-    fprintf(stderr, "main(): Failed to build Huffman codes.\n");
+  tokAt = (int *)malloc(sizeof(int) * lz77Size);
+  byteAt = (int *)malloc(sizeof(int) * lz77Size);
+  if (tokAt == NULL || byteAt == NULL) {
+    fprintf(stderr, "main(): Out of memory error.\n");
+    free(tokAt);
+    free(byteAt);
     free(lz77);
     return -1;
   }
 
-  j = 0;
-  for (i = 0; i < LIT_SYMBOLS; i++)
-    codeLengths[j++] = codeLengthLiterals[i];
-  for (i = 0; i < DIST_SYMBOLS; i++)
-    codeLengths[j++] = codeLengthDistances[i];
-
-  codeLengthMax = 0;
-  for (i = 0; i < LENGTH_TOTAL; i++) {
-    if (codeLengthMax < codeLengths[i])
-      codeLengthMax = codeLengths[i];
-  }
-  codesN = codeLengthMax + 4;
-  if (codesN < 4 || codesN > 119) {
-    fprintf(stderr, "main(): Code-length alphabet size %d is unusable.\n", codesN);
-    free(lz77);
-    return -1;
-  }
-
-  if (rle_code_lengths(codeLengths, codeLengthMax, &codeLengthsN) != 0) {
-    free(lz77);
-    return -1;
-  }
-
-  for (i = 0; i < codesN; i++)
-    freqCombined[i] = 0;
-
-  for (i = 0; i < codeLengthsN; i++) {
-    m = codeLengths[i] & 0xFFFF;
-    if (m < 0 || m >= codesN) {
-      fprintf(stderr, "main(): Code-length symbol %d is out of range.\n", m);
-      free(lz77);
-      return -1;
-    }
-    freqCombined[m]++;
-  }
-
-  if (huffmanBuildCodes(freqCombined, codesN, codeLengthCombined, codeCombined) != 0) {
-    fprintf(stderr, "main(): Failed to build code-length Huffman codes.\n");
+  if (build_bounds(lz77, lz77Size, inputSize, tokAt, byteAt, &nbounds) != 0 ||
+      plan_blocks(input, inputSize, lz77, tokAt, byteAt, nbounds, segs, &nsegs) != 0) {
+    free(tokAt);
+    free(byteAt);
     free(lz77);
     return -1;
   }
 
   if (inputSize > INT_MAX - 64 || bitbuf_init(&bits, inputSize + 64) != 0) {
     fprintf(stderr, "main(): Out of memory error.\n");
+    free(tokAt);
+    free(byteAt);
     free(lz77);
     return -1;
   }
 
   if (bitbuf_byte(&bits, 'D') != 0 || bitbuf_byte(&bits, 'E') != 0 ||
-      bitbuf_byte(&bits, 'F') != 0 || bitbuf_byte(&bits, 'c') != 0 ||
+      bitbuf_byte(&bits, 'F') != 0 || bitbuf_byte(&bits, 'd') != 0 ||
       bitbuf_byte(&bits, (unsigned char)(inputSize & 0xFF)) != 0 ||
       bitbuf_byte(&bits, (unsigned char)((inputSize >> 8) & 0xFF)) != 0 ||
       bitbuf_byte(&bits, (unsigned char)((inputSize >> 16) & 0xFF)) != 0 ||
-      bitbuf_byte(&bits, (unsigned char)((inputSize >> 24) & 0xFF)) != 0 ||
-      bitbuf_byte(&bits, (unsigned char)codesN) != 0) {
+      bitbuf_byte(&bits, (unsigned char)((inputSize >> 24) & 0xFF)) != 0) {
     fprintf(stderr, "main(): Out of memory error.\n");
     free(bits.data);
+    free(tokAt);
+    free(byteAt);
     free(lz77);
     return -1;
   }
 
-  n = 0;
-  for (i = 0; i < codesN; i++) {
-    if (n < codeLengthCombined[i])
-      n = codeLengthCombined[i];
-  }
-
-  if (n < 4)
-    k = 2;
-  else if (n < 8)
-    k = 3;
-  else if (n < 16)
-    k = 4;
-  else if (n < 32)
-    k = 5;
-  else if (n < 64)
-    k = 6;
-  else
-    k = 7;
-
-  if (bitbuf_bits(&bits, (unsigned int)k, 3) != 0) {
-    free(bits.data);
-    free(lz77);
-    return -1;
-  }
-
-  for (i = 0; i < codesN; i++) {
-    if (codeLengthCombined[i] < 0 || codeLengthCombined[i] >= (1 << k)) {
-      fprintf(stderr, "main(): Combined code length entry %d does not fit in %d bits.\n",
-              codeLengthCombined[i], k);
-      free(bits.data);
-      free(lz77);
-      return -1;
+  for (i = 0; i < nsegs; i++) {
+    if (segs[i].stored) {
+      if (emit_stored(&bits, input + segs[i].byte0,
+                      segs[i].byte1 - segs[i].byte0) != 0) {
+        free(bits.data);
+        free(tokAt);
+        free(byteAt);
+        free(lz77);
+        return -1;
+      }
     }
-    if (bitbuf_bits(&bits, (unsigned int)codeLengthCombined[i], k) != 0) {
+    else if (emit_huffman_range(&bits, lz77, segs[i].tok0, segs[i].tok1) != 0) {
       free(bits.data);
+      free(tokAt);
+      free(byteAt);
       free(lz77);
       return -1;
     }
   }
 
-  for (i = 0; i < codeLengthsN; i++) {
-    n = codeLengths[i] & 0xFFFF;
-    if (n < 0 || n >= codesN || codeLengthCombined[n] <= 0) {
-      fprintf(stderr, "main(): Cannot emit code-length symbol %d.\n", n);
-      free(bits.data);
-      free(lz77);
-      return -1;
-    }
-    if (bitbuf_bits(&bits, (unsigned int)codeCombined[n], codeLengthCombined[n]) != 0) {
-      free(bits.data);
-      free(lz77);
-      return -1;
-    }
-
-    if (n > codeLengthMax) {
-      int extra, extraLen;
-
-      extra = codeLengths[i] >> 16;
-      if (n == codeLengthMax + 1)
-        extraLen = 2;
-      else if (n == codeLengthMax + 2)
-        extraLen = 3;
-      else if (n == codeLengthMax + 3)
-        extraLen = 7;
-      else {
-        fprintf(stderr, "main(): Internal error, combined code %d is not supported.\n", n);
-        free(bits.data);
-        free(lz77);
-        return -1;
-      }
-      if (extra < 0 || extra >= (1 << extraLen) ||
-          bitbuf_bits(&bits, (unsigned int)extra, extraLen) != 0) {
-        free(bits.data);
-        free(lz77);
-        return -1;
-      }
-    }
-  }
-
-  i = 0;
-  while (i < lz77Size) {
-    int extra;
-
-    n = lz77[i] & 0xFFFF;
-    if (n < 0 || n >= LIT_SYMBOLS || codeLengthLiterals[n] <= 0 ||
-        codeLiterals[n] < 0) {
-      fprintf(stderr, "main(): Cannot emit literal symbol %d.\n", n);
-      free(bits.data);
-      free(lz77);
-      return -1;
-    }
-    if (bitbuf_bits(&bits, (unsigned int)codeLiterals[n], codeLengthLiterals[n]) != 0) {
-      free(bits.data);
-      free(lz77);
-      return -1;
-    }
-
-    if (n > 256) {
-      if (n > 285) {
-        fprintf(stderr, "main(): Bad length symbol %d.\n", n);
-        free(bits.data);
-        free(lz77);
-        return -1;
-      }
-      k = extraBitsLengths[n - 257];
-      if (k > 0) {
-        extra = lz77[i] >> 16;
-        if (extra < 0 || extra >= (1 << k) ||
-            bitbuf_bits(&bits, (unsigned int)extra, k) != 0) {
-          free(bits.data);
-          free(lz77);
-          return -1;
-        }
-      }
-      i++;
-
-      if (i >= lz77Size) {
-        fprintf(stderr, "main(): Truncated LZ77 pair while writing.\n");
-        free(bits.data);
-        free(lz77);
-        return -1;
-      }
-
-      n = lz77[i] & 0xFFFF;
-      if (n < 0 || n >= DIST_SYMBOLS || codeLengthDistances[n] <= 0 ||
-          codeDistances[n] < 0) {
-        fprintf(stderr, "main(): Cannot emit distance symbol %d.\n", n);
-        free(bits.data);
-        free(lz77);
-        return -1;
-      }
-      if (bitbuf_bits(&bits, (unsigned int)codeDistances[n], codeLengthDistances[n]) != 0) {
-        free(bits.data);
-        free(lz77);
-        return -1;
-      }
-
-      k = extraBitsDistances[n];
-      if (k > 0) {
-        extra = lz77[i] >> 16;
-        if (extra < 0 || extra >= (1 << k) ||
-            bitbuf_bits(&bits, (unsigned int)extra, k) != 0) {
-          free(bits.data);
-          free(lz77);
-          return -1;
-        }
-      }
-      i++;
-    }
-    else
-      i++;
-  }
-
-  if (bitbuf_finish(&bits) != 0) {
-    free(bits.data);
-    free(lz77);
-    return -1;
-  }
-
+  free(tokAt);
+  free(byteAt);
   free(lz77);
 
   *output = bits.data;
   *outputSize = bits.len;
   return 0;
 }
+
 
 
 #ifndef DEFLATE_LIBRARY
@@ -785,7 +1175,7 @@ int main(int argc, char *argv[]) {
   compressed = NULL;
 
   if (argc != 3) {
-    fprintf(stderr, "deflateTT v2.2 Written by Ville Helin 2007\n");
+    fprintf(stderr, "deflateTT v2.3 Written by Ville Helin 2007\n");
     fprintf(stderr, "USAGE: %s <INPUT FILE> <OUTPUT FILE>\n", argv[0]);
     return 1;
   }

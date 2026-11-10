@@ -7,8 +7,8 @@
 
 1. DESCRIPTION
 
-inflateTT-MP is the portable DEFc decompressor. Literal, length and
-distance symbols follow RFC 1951. The container is the DEFc layout
+inflateTT-MP is the portable DEFd decompressor. Literal, length and
+distance symbols follow RFC 1951. The container is the DEFd layout
 documented in the repository README, not a zlib or raw deflate stream.
 
 The motivation behind writing this piece of code was to get a simple and
@@ -23,7 +23,7 @@ Compile inflate.c into the project and call
               unsigned char *output, int outputCapacity,
               int *outputSize, struct InflateContext *context);
 
-outputCapacity must hold the uncompressed size from the DEFc header.
+outputCapacity must hold the uncompressed size from the DEFd header.
 Allocate InflateContext on the heap or in static storage; the node
 pool makes it too large for a small stack. Return values are the
 INFLATE_* codes in inflate.h.
@@ -47,6 +47,11 @@ vhelin#iki.fi.
 
 
 3. VERSION HISTORY
+
+v2.1 (10-Nov-2026)
+  * Reads "DEFd" files with more than one block, including stored
+    blocks. A single Huffman block is unchanged, and a match may
+    refer to a byte written by an earlier block.
 
 v2.0 (10-Nov-2026)
   * inflate() takes the input length and the output capacity and

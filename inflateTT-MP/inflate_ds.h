@@ -6,7 +6,7 @@
 
    output must be 2-byte aligned. outputBytes is the destination capacity
    in bytes and must be at least the uncompressed size stored in the
-   DEFc header. One static context is used, so this is not re-entrant.
+   DEFd header. One static context is used, so this is not re-entrant.
    A 0 return is success. Any other value is an INFLATE_* code from
    inflate.h. Include that header only from a file that does not also
    include this one: both headers declare inflate(). */

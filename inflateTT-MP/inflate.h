@@ -53,7 +53,7 @@ struct InflateContext {
 #define INFLATE_SIZE_MISMATCH   6
 #define INFLATE_BAD_ARGUMENT    7
 
-/* Decompress one DEFc buffer.
+/* Decompress one DEFd buffer.
    outputCapacity must be at least the uncompressed size stored in the
    header. On success *outputSize (when non-NULL) is that many bytes.
    The output buffer may be partially written when the return is not

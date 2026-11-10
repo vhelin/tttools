@@ -4,7 +4,7 @@ graphics. inflateTT-MP (LGPL v2.1) is the portable library. It can write
 bytes, or 16-bit words so a Nintendo DS destination can be VRAM.
 
 Literal bytes, length codes 257..285 and distance codes 0..29, including the
-extra-bit tables, match RFC 1951. The container does not. A DEFc file is not
+extra-bit tables, match RFC 1951. The container does not. A DEFd file is not
 zlib, gzip, or a raw deflate block. The format is described below.
 
 Build and test with gcc:
@@ -16,15 +16,17 @@ Cygwin's run looks up tests.exe before the tests directory, so this also works:
 
   run -wait tests
 
-deflateTT reads a raw file and writes DEFc. inflateTT does the reverse.
+deflateTT reads a raw file and writes DEFd. inflateTT does the reverse.
 
   deflateTT input.raw output.def
   inflateTT output.def output.raw
 
-The compressor builds one Huffman block for the whole file. Matches are
-lazy LZ77 over a 32768-byte window, found with a 3-byte hash chain.
-A match of length 3 is kept only when its distance is at most 4096,
-and any match is skipped when the next byte starts a longer one.
+The compressor may write several blocks. Each block is Huffman-coded
+or stored uncompressed, whichever is smaller, and a match can refer to
+a byte written by an earlier block. Matches are lazy LZ77 over a
+32768-byte window, found with a 3-byte hash chain. A match of length 3
+is kept only when its distance is at most 4096, and any match is
+skipped when the next byte starts a longer one.
 Code lengths are limited to 15 bits. An alphabet with fewer than two used
 symbols is given two length-1 codes, so a run of identical bytes and a file
 with no repeated 3-byte sequence both round-trip.
@@ -52,16 +54,20 @@ output must be 2-byte aligned. outputBytes is the capacity in bytes. A
 program that calls inflate_vram16 and supplies its own context compiles
 inflate.c instead, and does not use inflate_ds.c.
 
-DEFc format
+DEFd format
 
-Offset 0, 4 bytes: 'D' 'E' 'F' 'c'.
+Offset 0, 4 bytes: 'D' 'E' 'F' 'd'.
 Offset 4, uint32 little-endian: uncompressed size.
-Offset 8, one byte N: size of the code-length alphabet (4..119).
-The encoder sets N to (longest literal or distance code) + 4.
+The file is one or more blocks. Each block starts on a byte boundary.
+Offset 8, and the first byte of every later block, is a type byte T.
 
-The rest is a bitstream packed MSB first inside each byte (bit 7 is first).
-There is one block. There is no BFINAL, BTYPE, stored-block type, or zlib
-wrapper.
+T = 0 is a stored block. The next four bytes are a little-endian length
+of at least 1, then that many raw bytes. The length must not run past
+the uncompressed size in the header.
+
+T in 4..119 is a Huffman block. T is the code-length alphabet size N.
+The encoder sets N to (longest literal or distance code) + 4. The
+following bits are packed MSB first (bit 7 of the next byte is first):
 
 - 3 bits: width W of the following code lengths. The encoder uses 2..7.
 - N values of W bits each: code lengths for the code-length alphabet.
@@ -73,9 +79,16 @@ wrapper.
   Symbol N-2 is a run of zeros. Three extra bits, count = extra+3 (3..10).
   Symbol N-1 is a run of zeros. Seven extra bits, count = extra+11 (11..138).
 - A Huffman stream of literal/length symbols, then distances.
-  0..255 are bytes, 256 ends the block, 257..285 are match lengths.
+  0..255 are bytes, 256 ends this block, 257..285 are match lengths.
   Extra length and distance bits match RFC 1951.
-  A match distance must point at a byte already written.
+  A match distance must point at a byte already written, including a
+  byte written by an earlier block in this file.
+
+If the bytes written so far are still short of the uncompressed size,
+the decoder moves to the next byte and reads another block. Padding
+bits in the last byte of a Huffman block are ignored. When the count
+matches the header, the file ends. A file with one Huffman block is
+the same bitstream the previous DEFc container used after its magic.
 
 Canonical codes are assigned from the lengths as in RFC 1951 section 3.2.2.
 The encoder will not emit a code longer than 15 bits. The decoder still
