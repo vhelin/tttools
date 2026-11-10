@@ -38,11 +38,15 @@ static const int baseValueDistances[30] = {
 };
 
 
+/* index is the next byte not yet pulled into acc. The next bit to read
+   is the high bit of the low nbits of acc. Whole unused bytes are given
+   back by bit_sync so a lookahead cannot swallow the next block. */
 struct bitreader {
   const unsigned char *data;
   int size;
   int index;
-  int bit;
+  unsigned int acc;
+  int nbits;
 };
 
 
@@ -54,33 +58,61 @@ struct sink {
 };
 
 
-static int bit_get(struct bitreader *reader, int *out) {
+static int bit_need(struct bitreader *reader, int count) {
 
-  if (reader->bit < 0) {
-    if (reader->size < 1 || reader->index >= reader->size - 1)
-      return -1;
-    reader->index++;
-    reader->bit = 7;
-  }
-  if (reader->index >= reader->size)
+  if (count < 0 || count > INFLATE_MAX_BITS)
     return -1;
-  *out = (reader->data[reader->index] >> reader->bit) & 1;
-  reader->bit--;
+  while (reader->nbits < count) {
+    if (reader->nbits > 24 || reader->index >= reader->size)
+      return -1;
+    reader->acc = (reader->acc << 8) | reader->data[reader->index];
+    reader->index++;
+    reader->nbits += 8;
+  }
   return 0;
 }
 
 
 static int bit_getn(struct bitreader *reader, int count, int *out) {
 
-  int value, i, bit;
+  unsigned int value;
 
-  value = 0;
-  for (i = 0; i < count; i++) {
-    if (bit_get(reader, &bit) != 0)
-      return -1;
-    value = (value << 1) | bit;
+  if (count == 0) {
+    *out = 0;
+    return 0;
   }
-  *out = value;
+  if (bit_need(reader, count) != 0)
+    return -1;
+  reader->nbits -= count;
+  value = (reader->acc >> reader->nbits) & ((1U << count) - 1U);
+  if (reader->nbits == 0)
+    reader->acc = 0;
+  else
+    reader->acc &= (1U << reader->nbits) - 1U;
+  *out = (int)value;
+  return 0;
+}
+
+
+static int bit_get(struct bitreader *reader, int *out) {
+
+  return bit_getn(reader, 1, out);
+}
+
+
+/* Drop bytes that were pulled only to fill a decode-table lookup. */
+static int bit_sync(struct bitreader *reader) {
+
+  while (reader->nbits >= 8) {
+    if (reader->index <= 0)
+      return -1;
+    reader->nbits -= 8;
+    reader->index--;
+  }
+  if (reader->nbits == 0)
+    reader->acc = 0;
+  else
+    reader->acc &= (1U << reader->nbits) - 1U;
   return 0;
 }
 
@@ -205,16 +237,83 @@ static int construct_tree(struct InflateContext *context, struct InflateNode **r
 }
 
 
-static int decode_symbol(struct bitreader *reader, struct InflateNode *root, int *symbol) {
+static void fill_fast(struct InflateNode *nodes, struct InflateNode *root,
+                      struct InflateFast *table) {
+
+  int index, consumed, bit;
+  struct InflateNode *node;
+
+  for (index = 0; index < INFLATE_FAST_SIZE; index++) {
+    node = root;
+    consumed = 0;
+    table[index].node = -1;
+    table[index].symbol = -1;
+    table[index].bits = 0;
+    while (consumed < INFLATE_FAST_BITS && node != NULL && node->literal < 0) {
+      bit = (index >> (INFLATE_FAST_BITS - 1 - consumed)) & 1;
+      if (bit)
+        node = node->right;
+      else
+        node = node->left;
+      consumed++;
+    }
+    if (node != NULL && node->literal >= 0) {
+      table[index].symbol = node->literal;
+      table[index].bits = consumed;
+    }
+    else if (node != NULL && consumed == INFLATE_FAST_BITS) {
+      table[index].node = (int)(node - nodes);
+      table[index].bits = INFLATE_FAST_BITS;
+    }
+  }
+}
+
+
+static int decode_symbol(struct bitreader *reader, struct InflateNode *nodes,
+                        struct InflateNode *root, const struct InflateFast *fast,
+                        int *symbol) {
 
   struct InflateNode *node;
-  int steps, bit;
+  const struct InflateFast *ent;
+  int steps, bit, index;
 
-  if (root == NULL)
+  if (root == NULL || nodes == NULL || fast == NULL)
     return INFLATE_BAD_CODE;
 
-  node = root;
-  steps = 0;
+  while (reader->nbits < INFLATE_FAST_BITS &&
+         reader->index < reader->size && reader->nbits <= 24) {
+    reader->acc = (reader->acc << 8) | reader->data[reader->index];
+    reader->index++;
+    reader->nbits += 8;
+  }
+
+  if (reader->nbits >= INFLATE_FAST_BITS) {
+    index = (int)((reader->acc >> (reader->nbits - INFLATE_FAST_BITS)) &
+                  (unsigned int)(INFLATE_FAST_SIZE - 1));
+    ent = &fast[index];
+    if (ent->bits <= 0 || ent->bits > reader->nbits)
+      return INFLATE_BAD_CODE;
+    reader->nbits -= ent->bits;
+    if (reader->nbits == 0)
+      reader->acc = 0;
+    else
+      reader->acc &= (1U << reader->nbits) - 1U;
+    if (ent->node < 0) {
+      if (ent->symbol < 0)
+        return INFLATE_BAD_CODE;
+      *symbol = ent->symbol;
+      return INFLATE_OK;
+    }
+    if (ent->node >= INFLATE_MAX_TREE_NODES)
+      return INFLATE_BAD_CODE;
+    node = nodes + ent->node;
+    steps = ent->bits;
+  }
+  else {
+    node = root;
+    steps = 0;
+  }
+
   while (node->literal < 0) {
     if (steps >= INFLATE_MAX_BITS)
       return INFLATE_BAD_CODE;
@@ -278,6 +377,97 @@ static int sink_get(struct sink *out, int index, int *value) {
 }
 
 
+static int sink_bytes(struct sink *out, const unsigned char *src, int n) {
+
+  unsigned char *dst;
+  int i;
+
+  dst = out->bytes + out->n;
+  i = 0;
+  while (i + 4 <= n) {
+    dst[i] = src[i];
+    dst[i + 1] = src[i + 1];
+    dst[i + 2] = src[i + 2];
+    dst[i + 3] = src[i + 3];
+    i += 4;
+  }
+  while (i < n) {
+    dst[i] = src[i];
+    i++;
+  }
+  out->n += n;
+  return 0;
+}
+
+
+static int sink_vram_bytes(struct sink *out, const unsigned char *src, int n) {
+
+  int i;
+
+  i = 0;
+  if ((out->n & 1) != 0 && n > 0) {
+    if (sink_put(out, src[0]) != 0)
+      return -1;
+    i = 1;
+  }
+  while (i + 1 < n) {
+    out->vram[out->n >> 1] =
+      (unsigned short)(src[i] | (src[i + 1] << 8));
+    out->n += 2;
+    i += 2;
+  }
+  if (i < n && sink_put(out, src[i]) != 0)
+    return -1;
+  return 0;
+}
+
+
+/* Copy length bytes from distance back. A non-overlapping byte copy
+   moves several bytes at a time. VRAM is stored in halfwords once the
+   destination is aligned and the source is not the pair being written. */
+static int copy_match(struct sink *out, int distance, int length) {
+
+  int src, t, b0, b1;
+
+  if (distance < 1 || distance > 32768 || distance > out->n)
+    return INFLATE_BAD_DISTANCE;
+  if (out->n > out->cap || length > out->cap - out->n)
+    return INFLATE_SIZE_MISMATCH;
+
+  src = out->n - distance;
+  if (out->vram == NULL) {
+    if (distance >= length) {
+      sink_bytes(out, out->bytes + src, length);
+      return INFLATE_OK;
+    }
+    for (t = 0; t < length; t++)
+      out->bytes[out->n + t] = out->bytes[src + t];
+    out->n += length;
+    return INFLATE_OK;
+  }
+
+  while (length > 0) {
+    if ((out->n & 1) == 0 && length >= 2 && distance >= 2) {
+      if (sink_get(out, src, &b0) != 0 || sink_get(out, src + 1, &b1) != 0)
+        return INFLATE_BAD_DISTANCE;
+      out->vram[out->n >> 1] = (unsigned short)(b0 | (b1 << 8));
+      out->n += 2;
+      src += 2;
+      length -= 2;
+    }
+    else {
+      if (sink_get(out, src, &b0) != 0)
+        return INFLATE_BAD_DISTANCE;
+      if (sink_put(out, b0) != 0)
+        return INFLATE_SIZE_MISMATCH;
+      src++;
+      length--;
+    }
+  }
+  return INFLATE_OK;
+}
+
+
 static unsigned long read_u32le(const unsigned char *p) {
 
   return (unsigned long)p[0]
@@ -287,8 +477,9 @@ static unsigned long read_u32le(const unsigned char *p) {
 }
 
 
-/* Huffman block. reader is positioned at bit 7 of the first bitstream
-   byte. codesN is 4..119. Symbol 256 ends the block. */
+/* Huffman block. reader->index is the first bitstream byte and no bits
+   are buffered yet. codesN is 4..119. Symbol 256 ends the block.
+   On success, reader->index is the first byte of the next block. */
 static int inflate_huffman_block(struct bitreader *reader,
                                  struct InflateContext *context,
                                  struct sink *out, int codesN) {
@@ -324,6 +515,7 @@ static int inflate_huffman_block(struct bitreader *reader,
   if (construct_tree(context, &context->treeCombined, context->codeCombined,
                      context->codeLengthCombined, codesN) != 0)
     return INFLATE_BAD_CODE;
+  fill_fast(context->treeNodesFree, context->treeCombined, context->fastLit);
 
   for (j = 0; j < INFLATE_LIT_SYMBOLS; j++)
     context->codeLengthLiterals[j] = 0;
@@ -335,7 +527,8 @@ static int inflate_huffman_block(struct bitreader *reader,
   while (j < INFLATE_LIT_SYMBOLS + INFLATE_DIST_SYMBOLS) {
     int count, value;
 
-    rc = decode_symbol(reader, context->treeCombined, &sym);
+    rc = decode_symbol(reader, context->treeNodesFree, context->treeCombined,
+                       context->fastLit, &sym);
     if (rc != INFLATE_OK)
       return rc;
     if (sym < 0 || sym >= codesN)
@@ -396,12 +589,12 @@ static int inflate_huffman_block(struct bitreader *reader,
       construct_tree(context, &context->treeDistances, context->codeDistances,
                      context->codeLengthDistances, INFLATE_DIST_SYMBOLS) != 0)
     return INFLATE_BAD_CODE;
+  fill_fast(context->treeNodesFree, context->treeLiterals, context->fastLit);
+  fill_fast(context->treeNodesFree, context->treeDistances, context->fastDist);
 
   for (;;) {
-    int src;
-    int t;
-
-    rc = decode_symbol(reader, context->treeLiterals, &sym);
+    rc = decode_symbol(reader, context->treeNodesFree, context->treeLiterals,
+                       context->fastLit, &sym);
     if (rc != INFLATE_OK)
       return rc;
 
@@ -427,7 +620,8 @@ static int inflate_huffman_block(struct bitreader *reader,
     if (length < 3 || length > 258)
       return INFLATE_BAD_CODE;
 
-    rc = decode_symbol(reader, context->treeDistances, &sym);
+    rc = decode_symbol(reader, context->treeNodesFree, context->treeDistances,
+                       context->fastDist, &sym);
     if (rc != INFLATE_OK)
       return rc;
     if (sym < 0 || sym > 29)
@@ -439,22 +633,13 @@ static int inflate_huffman_block(struct bitreader *reader,
         return INFLATE_TRUNCATED;
       distance += e;
     }
-    if (distance < 1 || distance > 32768 || distance > out->n)
-      return INFLATE_BAD_DISTANCE;
-    if (out->n > out->cap || length > out->cap - out->n)
-      return INFLATE_SIZE_MISMATCH;
-
-    src = out->n - distance;
-    for (t = 0; t < length; t++) {
-      int byte;
-
-      if (sink_get(out, src + t, &byte) != 0)
-        return INFLATE_BAD_DISTANCE;
-      if (sink_put(out, byte) != 0)
-        return INFLATE_SIZE_MISMATCH;
-    }
+    rc = copy_match(out, distance, length);
+    if (rc != INFLATE_OK)
+      return rc;
   }
 
+  if (bit_sync(reader) != 0)
+    return INFLATE_BAD_CODE;
   return INFLATE_OK;
 }
 
@@ -465,7 +650,7 @@ static int inflate_stored(const unsigned char *data, int dataSize, int pos,
                           struct sink *out, int claimed, int *nextPos) {
 
   unsigned long lengthLong;
-  int length, i;
+  int length;
 
   if (pos < 0 || dataSize < 4 || pos > dataSize - 4)
     return INFLATE_TRUNCATED;
@@ -479,10 +664,11 @@ static int inflate_stored(const unsigned char *data, int dataSize, int pos,
   if (length > dataSize - (pos + 4))
     return INFLATE_TRUNCATED;
 
-  for (i = 0; i < length; i++) {
-    if (sink_put(out, data[pos + 4 + i]) != 0)
-      return INFLATE_SIZE_MISMATCH;
+  if (out->vram == NULL) {
+    sink_bytes(out, data + pos + 4, length);
   }
+  else if (sink_vram_bytes(out, data + pos + 4, length) != 0)
+    return INFLATE_SIZE_MISMATCH;
   *nextPos = pos + 4 + length;
   return INFLATE_OK;
 }
@@ -535,11 +721,12 @@ static int inflate_stream(const unsigned char *data, int dataSize,
       reader.data = data;
       reader.size = dataSize;
       reader.index = pos + 1;
-      reader.bit = 7;
+      reader.acc = 0;
+      reader.nbits = 0;
       rc = inflate_huffman_block(&reader, context, out, type);
       if (rc != INFLATE_OK)
         return rc;
-      pos = reader.index + 1;
+      pos = reader.index;
     }
     else
       return INFLATE_BAD_CODE;

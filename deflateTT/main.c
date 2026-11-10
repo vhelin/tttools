@@ -23,7 +23,6 @@
 #define LZ_MAX_LEN  258
 #define LZ_MIN_LEN  3
 #define LZ_TOO_FAR  4096
-#define LZ_LAZY_LIMIT LZ_MAX_LEN
 #define LZ_HASH_BITS 15
 #define LZ_HASH_SIZE (1 << LZ_HASH_BITS)
 
@@ -125,24 +124,26 @@ static int bitbuf_byte(struct bitbuf *b, unsigned char value) {
 }
 
 
-/* MSB first, matching the inflater. A length of 0 writes nothing. */
+/* MSB first, matching the inflater. A length of 0 writes nothing.
+   The buffered bits are the low nbits of acc. */
 static int bitbuf_bits(struct bitbuf *b, unsigned int code, int codeLength) {
-
-  int i;
 
   if (codeLength < 0 || codeLength > 15)
     return -1;
+  if (codeLength == 0)
+    return 0;
 
-  for (i = 0; i < codeLength; i++) {
-    b->acc = (b->acc << 1) | ((code >> (codeLength - i - 1)) & 1U);
-    b->nbits++;
-    if (b->nbits == 8) {
-      if (bitbuf_byte(b, (unsigned char)b->acc) != 0)
-        return -1;
-      b->acc = 0;
-      b->nbits = 0;
-    }
+  b->acc = (b->acc << codeLength) | (code & ((1U << codeLength) - 1U));
+  b->nbits += codeLength;
+  while (b->nbits >= 8) {
+    b->nbits -= 8;
+    if (bitbuf_byte(b, (unsigned char)(b->acc >> b->nbits)) != 0)
+      return -1;
   }
+  if (b->nbits == 0)
+    b->acc = 0;
+  else
+    b->acc &= (1U << b->nbits) - 1U;
   return 0;
 }
 
@@ -168,8 +169,17 @@ static int bitbuf_bytes(struct bitbuf *b, const unsigned char *bytes, int n) {
     return -1;
   if (bitbuf_grow(b, n) != 0)
     return -1;
-  for (i = 0; i < n; i++)
-    b->data[b->len++] = bytes[i];
+  i = 0;
+  while (i + 4 <= n) {
+    b->data[b->len] = bytes[i];
+    b->data[b->len + 1] = bytes[i + 1];
+    b->data[b->len + 2] = bytes[i + 2];
+    b->data[b->len + 3] = bytes[i + 3];
+    b->len += 4;
+    i += 4;
+  }
+  while (i < n)
+    b->data[b->len++] = bytes[i++];
   return 0;
 }
 
@@ -198,12 +208,16 @@ static void lz_insert(const unsigned char *data, int fileSize, int *head, int *p
 static void lz_find(const unsigned char *data, int fileSize, const int *head,
                     const int *prev, int i, int *bestLenOut, int *bestDistOut) {
 
-  int h, j, n, dist, chain, bestLen, bestDist;
+  int h, j, n, dist, chain, bestLen, bestDist, limit;
 
   bestLen = 0;
   bestDist = 0;
+  limit = 0;
 
   if (i + LZ_MIN_LEN <= fileSize) {
+    limit = fileSize - i;
+    if (limit > LZ_MAX_LEN)
+      limit = LZ_MAX_LEN;
     h = (int)lz_hash(data + i);
     chain = 0;
     for (j = head[h]; j >= 0; j = prev[j]) {
@@ -216,7 +230,13 @@ static void lz_find(const unsigned char *data, int fileSize, const int *head,
       if (i + bestLen < fileSize && data[j + bestLen] != data[i + bestLen])
         continue;
       n = 0;
-      while (n < LZ_MAX_LEN && i + n < fileSize && data[j + n] == data[i + n])
+      while (n + 4 <= limit &&
+             data[j + n] == data[i + n] &&
+             data[j + n + 1] == data[i + n + 1] &&
+             data[j + n + 2] == data[i + n + 2] &&
+             data[j + n + 3] == data[i + n + 3])
+        n += 4;
+      while (n < limit && data[j + n] == data[i + n])
         n++;
       if (n > bestLen) {
         bestLen = n;
@@ -238,7 +258,8 @@ static void lz_find(const unsigned char *data, int fileSize, const int *head,
 
 
 /* Lazy LZ77. A 3-byte hash chain replaces the old window scan.
-   Any match is skipped when the next byte starts a longer one. */
+   A match shorter than 258 bytes is skipped when the next byte starts
+   a longer one. A match of 258 bytes cannot be beaten by the next byte. */
 static int lz77_compress(const unsigned char *data, int fileSize, int *lz77,
                          int lz77Cap, int *lz77SizeOut, int *matches, int *dupBytes) {
 
@@ -272,7 +293,7 @@ static int lz77_compress(const unsigned char *data, int fileSize, int *lz77,
     lz_find(data, fileSize, head, prev, i, &bestLen, &bestDist);
     lz_insert(data, fileSize, head, prev, i);
 
-    if (bestLen >= LZ_MIN_LEN && bestLen <= LZ_LAZY_LIMIT &&
+    if (bestLen >= LZ_MIN_LEN && bestLen < LZ_MAX_LEN &&
         i + 1 + LZ_MIN_LEN <= fileSize) {
       lz_find(data, fileSize, head, prev, i + 1, &nextLen, &nextDist);
       if (nextLen > bestLen && nextDist > 0) {
@@ -501,14 +522,82 @@ static int span_bytes(const int *lz77, int lz77Size, int i, int *step) {
 }
 
 
+/* Running size of a block that is not written out. bytes counts finished
+   bytes. nbits is the unfinished tail, 0..7, matching bitbuf_finish. */
+struct bitcount {
+  int bytes;
+  int nbits;
+};
+
+
+static int count_bits(struct bitcount *count, int n) {
+
+  int room, take;
+
+  if (n < 0)
+    return -1;
+  while (n > 0) {
+    room = 8 - count->nbits;
+    take = n < room ? n : room;
+    count->nbits += take;
+    n -= take;
+    if (count->nbits == 8) {
+      if (count->bytes == INT_MAX)
+        return -1;
+      count->bytes++;
+      count->nbits = 0;
+    }
+  }
+  return 0;
+}
+
+
+static int count_size(const struct bitcount *count) {
+
+  if (count->nbits == 0)
+    return count->bytes;
+  if (count->bytes == INT_MAX)
+    return -1;
+  return count->bytes + 1;
+}
+
+
+static int put_bits(struct bitbuf *bits, struct bitcount *count,
+                    unsigned int code, int codeLength) {
+
+  if (bits == NULL)
+    return count_bits(count, codeLength);
+  return bitbuf_bits(bits, code, codeLength);
+}
+
+
+static int put_byte(struct bitbuf *bits, struct bitcount *count, unsigned char value) {
+
+  if (bits == NULL) {
+    if (count->nbits != 0)
+      return -1;
+    return count_bits(count, 8);
+  }
+  return bitbuf_byte(bits, value);
+}
+
+
 /* Huffman-encode tokens [begin, end) and an end-of-block symbol.
-   The block starts with the code-length alphabet size, on a byte boundary. */
-static int emit_huffman_range(struct bitbuf *bits, const int *lz77, int begin, int end) {
+   The block starts with the code-length alphabet size, on a byte boundary.
+   A NULL bit buffer counts the same bytes without writing them. */
+static int emit_huffman_range(struct bitbuf *bits, struct bitcount *counted,
+                              const int *lz77, int begin, int end) {
 
   int i, j, k, m, n;
   int codeLengthMax, codesN, codeLengthsN;
 
-  if (bits->nbits != 0 || begin < 0 || end < begin)
+  if (begin < 0 || end < begin)
+    return -1;
+  if (bits == NULL) {
+    if (counted == NULL)
+      return -1;
+  }
+  else if (bits->nbits != 0)
     return -1;
 
   for (i = 0; i < LIT_SYMBOLS; i++)
@@ -585,7 +674,7 @@ static int emit_huffman_range(struct bitbuf *bits, const int *lz77, int begin, i
     return -1;
   }
 
-  if (bitbuf_byte(bits, (unsigned char)codesN) != 0)
+  if (put_byte(bits, counted, (unsigned char)codesN) != 0)
     return -1;
 
   n = 0;
@@ -607,7 +696,7 @@ static int emit_huffman_range(struct bitbuf *bits, const int *lz77, int begin, i
   else
     k = 7;
 
-  if (bitbuf_bits(bits, (unsigned int)k, 3) != 0)
+  if (put_bits(bits, counted, (unsigned int)k, 3) != 0)
     return -1;
 
   for (i = 0; i < codesN; i++) {
@@ -616,7 +705,7 @@ static int emit_huffman_range(struct bitbuf *bits, const int *lz77, int begin, i
               codeLengthCombined[i], k);
       return -1;
     }
-    if (bitbuf_bits(bits, (unsigned int)codeLengthCombined[i], k) != 0)
+    if (put_bits(bits, counted, (unsigned int)codeLengthCombined[i], k) != 0)
       return -1;
   }
 
@@ -628,7 +717,7 @@ static int emit_huffman_range(struct bitbuf *bits, const int *lz77, int begin, i
       fprintf(stderr, "main(): Cannot emit code-length symbol %d.\n", n);
       return -1;
     }
-    if (bitbuf_bits(bits, (unsigned int)codeCombined[n], codeLengthCombined[n]) != 0)
+    if (put_bits(bits, counted, (unsigned int)codeCombined[n], codeLengthCombined[n]) != 0)
       return -1;
 
     if (n > codeLengthMax) {
@@ -644,7 +733,7 @@ static int emit_huffman_range(struct bitbuf *bits, const int *lz77, int begin, i
         return -1;
       }
       if (extra < 0 || extra >= (1 << extraLen) ||
-          bitbuf_bits(bits, (unsigned int)extra, extraLen) != 0)
+          put_bits(bits, counted, (unsigned int)extra, extraLen) != 0)
         return -1;
     }
   }
@@ -659,7 +748,7 @@ static int emit_huffman_range(struct bitbuf *bits, const int *lz77, int begin, i
       fprintf(stderr, "main(): Cannot emit literal symbol %d.\n", n);
       return -1;
     }
-    if (bitbuf_bits(bits, (unsigned int)codeLiterals[n], codeLengthLiterals[n]) != 0)
+    if (put_bits(bits, counted, (unsigned int)codeLiterals[n], codeLengthLiterals[n]) != 0)
       return -1;
 
     if (n > 256) {
@@ -671,7 +760,7 @@ static int emit_huffman_range(struct bitbuf *bits, const int *lz77, int begin, i
       if (k > 0) {
         extra = lz77[i] >> 16;
         if (extra < 0 || extra >= (1 << k) ||
-            bitbuf_bits(bits, (unsigned int)extra, k) != 0)
+            put_bits(bits, counted, (unsigned int)extra, k) != 0)
           return -1;
       }
       i++;
@@ -687,14 +776,14 @@ static int emit_huffman_range(struct bitbuf *bits, const int *lz77, int begin, i
         fprintf(stderr, "main(): Cannot emit distance symbol %d.\n", n);
         return -1;
       }
-      if (bitbuf_bits(bits, (unsigned int)codeDistances[n], codeLengthDistances[n]) != 0)
+      if (put_bits(bits, counted, (unsigned int)codeDistances[n], codeLengthDistances[n]) != 0)
         return -1;
 
       k = extraBitsDistances[n];
       if (k > 0) {
         extra = lz77[i] >> 16;
         if (extra < 0 || extra >= (1 << k) ||
-            bitbuf_bits(bits, (unsigned int)extra, k) != 0)
+            put_bits(bits, counted, (unsigned int)extra, k) != 0)
           return -1;
       }
       i++;
@@ -708,8 +797,10 @@ static int emit_huffman_range(struct bitbuf *bits, const int *lz77, int begin, i
     fprintf(stderr, "main(): Cannot emit literal symbol %d.\n", n);
     return -1;
   }
-  if (bitbuf_bits(bits, (unsigned int)codeLiterals[n], codeLengthLiterals[n]) != 0)
+  if (put_bits(bits, counted, (unsigned int)codeLiterals[n], codeLengthLiterals[n]) != 0)
     return -1;
+  if (bits == NULL)
+    return 0;
   return bitbuf_finish(bits);
 }
 
@@ -728,22 +819,17 @@ static int emit_stored(struct bitbuf *bits, const unsigned char *raw, int n) {
 }
 
 
-static int huffman_cost(const int *lz77, int tok0, int tok1, int rawLen) {
+static int huffman_cost(const int *lz77, int tok0, int tok1) {
 
-  struct bitbuf bits;
-  int rc, n, cap;
+  struct bitcount counted;
+  int rc;
 
-  if (rawLen < 0 || rawLen > INT_MAX - 64)
-    return -1;
-  cap = rawLen + 64;
-  if (bitbuf_init(&bits, cap) != 0)
-    return -1;
-  rc = emit_huffman_range(&bits, lz77, tok0, tok1);
-  n = bits.len;
-  free(bits.data);
+  counted.bytes = 0;
+  counted.nbits = 0;
+  rc = emit_huffman_range(NULL, &counted, lz77, tok0, tok1);
   if (rc != 0)
     return -1;
-  return n;
+  return count_size(&counted);
 }
 
 
@@ -916,7 +1002,7 @@ static int segment_choice(const int *lz77, int tok0, int tok1,
   raw = byte1 - byte0;
   if (raw < 0 || tok0 > tok1)
     return -1;
-  huff = huffman_cost(lz77, tok0, tok1, raw > 0 ? raw : 0);
+  huff = huffman_cost(lz77, tok0, tok1);
   if (huff < 0)
     return -1;
   if (raw > 0 && raw <= INT_MAX - 5) {
@@ -1143,7 +1229,7 @@ int deflate_bytes(const unsigned char *input, int inputSize,
         return -1;
       }
     }
-    else if (emit_huffman_range(&bits, lz77, segs[i].tok0, segs[i].tok1) != 0) {
+    else if (emit_huffman_range(&bits, NULL, lz77, segs[i].tok0, segs[i].tok1) != 0) {
       free(bits.data);
       free(tokAt);
       free(byteAt);

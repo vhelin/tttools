@@ -5,10 +5,12 @@
 extern "C" {
 #endif
 
-/* The compressor emits codes of at most 15 bits. The decoder accepts
-   codes up to 31 bits so files written by older deflateTT builds,
-   which did not limit code length, still decompress. */
-#define INFLATE_MAX_BITS 31
+/* Codes are at most 15 bits. A longer length is rejected. */
+#define INFLATE_MAX_BITS 15
+
+/* First-level decode table. Longer codes walk the remaining tree. */
+#define INFLATE_FAST_BITS 9
+#define INFLATE_FAST_SIZE (1 << INFLATE_FAST_BITS)
 
 #define INFLATE_LIT_SYMBOLS 286
 #define INFLATE_DIST_SYMBOLS 30
@@ -21,9 +23,19 @@ struct InflateNode {
   int literal;
 };
 
-/* About 17 KB on a 32-bit target and about 30 KB on a 64-bit target,
-   because the node pool is embedded. Allocate it with malloc or keep
-   it in static storage. Do not put it on a small stack. */
+/* node is an index into the node pool, or -1 when the entry is a
+   finished symbol or an invalid prefix. */
+struct InflateFast {
+  int node;
+  int symbol;
+  int bits;
+};
+
+/* The node pool and two decode tables are embedded, so this is a few
+   tens of kilobytes. Allocate it with malloc or keep it in static
+   storage. Do not put it on a small stack. fastLit is also the table
+   for the code-length tree, which is not live at the same time as
+   the literal tree. */
 struct InflateContext {
   int tmpCount[INFLATE_MAX_BITS + 1];
   int nextCode[INFLATE_MAX_BITS + 1];
@@ -42,6 +54,9 @@ struct InflateContext {
 
   int treeNodesFreeCurrent;
   struct InflateNode treeNodesFree[INFLATE_MAX_TREE_NODES];
+
+  struct InflateFast fastLit[INFLATE_FAST_SIZE];
+  struct InflateFast fastDist[INFLATE_FAST_SIZE];
 };
 
 #define INFLATE_OK              0

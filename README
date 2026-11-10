@@ -91,9 +91,8 @@ matches the header, the file ends. A file with one Huffman block is
 the same bitstream the previous DEFc container used after its magic.
 
 Canonical codes are assigned from the lengths as in RFC 1951 section 3.2.2.
-The encoder will not emit a code longer than 15 bits. The decoder still
-accepts codes up to 31 bits, which is as far as older deflateTT builds could
-go without overflowing a 32-bit code.
+The encoder will not emit a code longer than 15 bits. The decoder rejects
+a longer code.
 
 The sources were originally hosted at https://www.villehelin.com/nintendoDS.html
 and moved to GitHub in 2021.
