@@ -22,7 +22,7 @@
 #define LZ_MAX_LEN  258
 #define LZ_MIN_LEN  3
 #define LZ_TOO_FAR  4096
-#define LZ_LAZY_LIMIT 16
+#define LZ_LAZY_LIMIT LZ_MAX_LEN
 #define LZ_HASH_BITS 15
 #define LZ_HASH_SIZE (1 << LZ_HASH_BITS)
 
@@ -218,7 +218,7 @@ static void lz_find(const unsigned char *data, int fileSize, const int *head,
 
 
 /* Lazy LZ77. A 3-byte hash chain replaces the old window scan.
-   A short match is skipped when the next byte starts a longer one. */
+   Any match is skipped when the next byte starts a longer one. */
 static int lz77_compress(const unsigned char *data, int fileSize, int *lz77,
                          int lz77Cap, int *lz77SizeOut, int *matches, int *dupBytes) {
 
@@ -785,7 +785,7 @@ int main(int argc, char *argv[]) {
   compressed = NULL;
 
   if (argc != 3) {
-    fprintf(stderr, "deflateTT v2.1 Written by Ville Helin 2007\n");
+    fprintf(stderr, "deflateTT v2.2 Written by Ville Helin 2007\n");
     fprintf(stderr, "USAGE: %s <INPUT FILE> <OUTPUT FILE>\n", argv[0]);
     return 1;
   }

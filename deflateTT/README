@@ -29,6 +29,11 @@ vhelin#iki.fi.
 
 3. VERSION HISTORY
 
+v2.2 (10-Nov-2026)
+  * Lazy matching looks one byte ahead for every match, up to the
+    maximum length of 258. Previously it stopped looking once the
+    current match was longer than 16 bytes.
+
 v2.1 (10-Nov-2026)
   * Matching is lazy, and a length-3 match farther than 4096 bytes is
     not emitted.

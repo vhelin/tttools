@@ -928,6 +928,71 @@ static void check_lazy_gain(void) {
 }
 
 
+/* Each lead byte has a length-20 match, and the next byte starts a
+   length-80 copy. Length 20 is past the old 16-byte lookahead cutoff,
+   which stores this file as 1382 bytes and 606 matches. Looking ahead
+   for every match stores it as 1128 bytes and 406 matches. */
+static int fill_long_lazy(unsigned char *buf) {
+
+  int i, m, n;
+  unsigned char pat[80];
+  unsigned char stop;
+
+  for (i = 0; i < 80; i++)
+    pat[i] = (unsigned char)((i * 17 + 3) & 255);
+  stop = (unsigned char)((pat[19] != 0xFF) ? 0xFF : 0xFE);
+  n = 0;
+  memcpy(buf + n, pat, 80);
+  n += 80;
+  for (m = 0; m < 200; m++) {
+    buf[n++] = (unsigned char)(m & 255);
+    memcpy(buf + n, pat, 19);
+    n += 19;
+    buf[n++] = stop;
+  }
+  memset(buf + n, 0x11, 1500);
+  n += 1500;
+  for (m = 0; m < 200; m++) {
+    buf[n++] = (unsigned char)(m & 255);
+    memcpy(buf + n, pat, 80);
+    n += 80;
+  }
+  return n;
+}
+
+
+static void check_long_lazy(void) {
+
+  unsigned char *buf;
+  unsigned char *comp;
+  char why[80];
+  int n, compSize, matches, dups, rc;
+
+  buf = (unsigned char *)malloc(21980);
+  if (buf == NULL) {
+    fail("lazy long match", "out of memory");
+    return;
+  }
+  n = fill_long_lazy(buf);
+  comp = NULL;
+  compSize = 0;
+  matches = -1;
+  dups = -1;
+  rc = deflate_bytes(buf, n, &comp, &compSize, &matches, &dups);
+  if (n != 21980 || rc != 0 || matches != 406 || dups != 21499) {
+    sprintf(why, "got %d matches and %d duplicate bytes", matches, dups);
+    fail("lazy long match", why);
+  }
+  else if (compSize > 1200) {
+    sprintf(why, "compressed to %d bytes", compSize);
+    fail("lazy long match", why);
+  }
+  free(comp);
+  check_roundtrip("lazy long match", buf, n);
+  free(buf);
+}
+
+
 static void fill_lcg(unsigned char *buf, int n, unsigned long seed) {
 
   int i;
@@ -1011,6 +1076,7 @@ int main(void) {
 
   check_window(buf);
   check_lazy_gain();
+  check_long_lazy();
   check_errors();
   check_decoder_edges();
 
