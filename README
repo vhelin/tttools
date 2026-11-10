@@ -22,7 +22,9 @@ deflateTT reads a raw file and writes DEFc. inflateTT does the reverse.
   inflateTT output.def output.raw
 
 The compressor builds one Huffman block for the whole file. Matches are
-greedy LZ77 over a 32768-byte window, found with a 3-byte hash chain.
+lazy LZ77 over a 32768-byte window, found with a 3-byte hash chain.
+A match of length 3 is kept only when its distance is at most 4096,
+and a short match is skipped when the next byte starts a longer one.
 Code lengths are limited to 15 bits. An alphabet with fewer than two used
 symbols is given two length-1 codes, so a run of identical bytes and a file
 with no repeated 3-byte sequence both round-trip.

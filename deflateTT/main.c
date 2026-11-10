@@ -21,6 +21,8 @@
 #define LZ_MAX_DIST 32768
 #define LZ_MAX_LEN  258
 #define LZ_MIN_LEN  3
+#define LZ_TOO_FAR  4096
+#define LZ_LAZY_LIMIT 16
 #define LZ_HASH_BITS 15
 #define LZ_HASH_SIZE (1 << LZ_HASH_BITS)
 
@@ -158,13 +160,70 @@ static unsigned lz_hash(const unsigned char *p) {
 }
 
 
-/* Greedy LZ77. A 3-byte hash chain replaces the old window scan.
-   The longest match wins, and an equal length keeps the nearer one. */
+static void lz_insert(const unsigned char *data, int fileSize, int *head, int *prev, int i) {
+
+  int h;
+
+  if (i + LZ_MIN_LEN <= fileSize) {
+    h = (int)lz_hash(data + i);
+    prev[i] = head[h];
+    head[h] = i;
+  }
+}
+
+
+/* Longest match at i. The chain is newest-first, so an equal length keeps
+   the nearer copy. A length-3 match farther than LZ_TOO_FAR costs more
+   than three literals, so it is not reported. */
+static void lz_find(const unsigned char *data, int fileSize, const int *head,
+                    const int *prev, int i, int *bestLenOut, int *bestDistOut) {
+
+  int h, j, n, dist, chain, bestLen, bestDist;
+
+  bestLen = 0;
+  bestDist = 0;
+
+  if (i + LZ_MIN_LEN <= fileSize) {
+    h = (int)lz_hash(data + i);
+    chain = 0;
+    for (j = head[h]; j >= 0; j = prev[j]) {
+      chain++;
+      if (chain > fileSize)
+        break;
+      dist = i - j;
+      if (dist <= 0 || dist > LZ_MAX_DIST)
+        break;
+      if (i + bestLen < fileSize && data[j + bestLen] != data[i + bestLen])
+        continue;
+      n = 0;
+      while (n < LZ_MAX_LEN && i + n < fileSize && data[j + n] == data[i + n])
+        n++;
+      if (n > bestLen) {
+        bestLen = n;
+        bestDist = dist;
+        if (bestLen == LZ_MAX_LEN || i + bestLen == fileSize)
+          break;
+      }
+    }
+  }
+
+  if (bestLen == LZ_MIN_LEN && bestDist > LZ_TOO_FAR) {
+    bestLen = 0;
+    bestDist = 0;
+  }
+
+  *bestLenOut = bestLen;
+  *bestDistOut = bestDist;
+}
+
+
+/* Lazy LZ77. A 3-byte hash chain replaces the old window scan.
+   A short match is skipped when the next byte starts a longer one. */
 static int lz77_compress(const unsigned char *data, int fileSize, int *lz77,
                          int lz77Cap, int *lz77SizeOut, int *matches, int *dupBytes) {
 
   int *head, *prev;
-  int i, h, j, n, dist, chain, bestLen, bestDist, lz77Size;
+  int i, k, bestLen, bestDist, nextLen, nextDist, lz77Size;
   int matchCount, duplicateBytes;
 
   head = NULL;
@@ -190,38 +249,25 @@ static int lz77_compress(const unsigned char *data, int fileSize, int *lz77,
 
   i = 0;
   while (i < fileSize) {
-    bestLen = 0;
-    bestDist = 0;
+    lz_find(data, fileSize, head, prev, i, &bestLen, &bestDist);
+    lz_insert(data, fileSize, head, prev, i);
 
-    if (i + LZ_MIN_LEN <= fileSize) {
-      h = (int)lz_hash(data + i);
-      chain = 0;
-      for (j = head[h]; j >= 0; j = prev[j]) {
-        chain++;
-        if (chain > fileSize)
-          break;
-        dist = i - j;
-        if (dist <= 0 || dist > LZ_MAX_DIST)
-          break;
-        if (i + bestLen < fileSize && data[j + bestLen] != data[i + bestLen])
-          continue;
-        n = 0;
-        while (n < LZ_MAX_LEN && i + n < fileSize && data[j + n] == data[i + n])
-          n++;
-        if (n > bestLen) {
-          bestLen = n;
-          bestDist = dist;
-          if (bestLen == LZ_MAX_LEN || i + bestLen == fileSize)
-            break;
+    if (bestLen >= LZ_MIN_LEN && bestLen <= LZ_LAZY_LIMIT &&
+        i + 1 + LZ_MIN_LEN <= fileSize) {
+      lz_find(data, fileSize, head, prev, i + 1, &nextLen, &nextDist);
+      if (nextLen > bestLen && nextDist > 0) {
+        if (lz77Size + 1 >= lz77Cap) {
+          free(head);
+          free(prev);
+          return -1;
         }
+        lz77[lz77Size++] = data[i];
+        i++;
+        continue;
       }
-      prev[i] = head[h];
-      head[h] = i;
     }
 
     if (bestLen >= LZ_MIN_LEN) {
-      int k;
-
       if (lz77Size + 2 >= lz77Cap) {
         free(head);
         free(prev);
@@ -232,13 +278,8 @@ static int lz77_compress(const unsigned char *data, int fileSize, int *lz77,
       matchCount++;
       duplicateBytes += bestLen;
 
-      for (k = 1; k < bestLen; k++) {
-        if (i + k + LZ_MIN_LEN <= fileSize) {
-          h = (int)lz_hash(data + i + k);
-          prev[i + k] = head[h];
-          head[h] = i + k;
-        }
-      }
+      for (k = 1; k < bestLen; k++)
+        lz_insert(data, fileSize, head, prev, i + k);
       i += bestLen;
     }
     else {
@@ -744,7 +785,7 @@ int main(int argc, char *argv[]) {
   compressed = NULL;
 
   if (argc != 3) {
-    fprintf(stderr, "deflateTT v2.0 Written by Ville Helin 2007\n");
+    fprintf(stderr, "deflateTT v2.1 Written by Ville Helin 2007\n");
     fprintf(stderr, "USAGE: %s <INPUT FILE> <OUTPUT FILE>\n", argv[0]);
     return 1;
   }

@@ -506,16 +506,16 @@ static void check_window(unsigned char *buf) {
   matches = -1;
   dups = -1;
   rc = deflate_bytes(buf, 32772, &comp, &compSize, &matches, &dups);
-  if (rc != 0 || matches != 1 || dups != 3) {
+  if (rc != 0 || matches != 0 || dups != 0) {
     sprintf(why, "got %d matches and %d duplicate bytes", matches, dups);
-    fail("distance 32768", why);
+    fail("far length 3", why);
   }
   out = (unsigned char *)malloc(32772);
   produced = 0;
   if (out != NULL && comp != NULL) {
     rc = inflate(comp, compSize, out, 32772, &produced, ctx);
     if (rc != INFLATE_OK || produced != 32772 || memcmp(buf, out, 32772) != 0)
-      fail("distance 32768", "round-trip mismatch");
+      fail("far length 3", "round-trip mismatch");
   }
   free(comp);
   comp = NULL;
@@ -832,6 +832,102 @@ static void check_decoder_edges(void) {
 }
 
 
+/* One epoch is 4 pattern bytes, 256 four-byte traps, 2049 zeros and
+   256 five-byte blocks. The length-3 trap for each lead byte sits
+   3073..3328 bytes back: 13 extra distance bits, still under the
+   matcher's 4096 cutoff, so this is the lazy decision and not the
+   far length-3 rejection. The next byte is a length-4 copy of the
+   pattern. A greedy matcher keeps the length-3 trap and stores the
+   last two pattern bytes as literals (one epoch 1061 bytes and 3584
+   duplicate bytes; sixteen epochs 20022 bytes and 57419 duplicate
+   bytes). Lazy emits the lead byte and keeps the length-4 match. */
+static int fill_lazy_traps(unsigned char *buf, int epochs) {
+
+  int e, m, n, base;
+  unsigned char pat[4];
+
+  n = 0;
+  for (e = 0; e < epochs; e++) {
+    base = 1 + (e * 4) % 200;
+    pat[0] = (unsigned char)(200 + ((base + 0) % 50));
+    pat[1] = (unsigned char)(200 + ((base + 1) % 50));
+    pat[2] = (unsigned char)(200 + ((base + 2) % 50));
+    pat[3] = (unsigned char)(200 + ((base + 3) % 50));
+    memcpy(buf + n, pat, 4);
+    n += 4;
+    for (m = 0; m < 256; m++) {
+      buf[n++] = (unsigned char)m;
+      buf[n++] = pat[0];
+      buf[n++] = pat[1];
+      buf[n++] = 0;
+    }
+    memset(buf + n, 0, 2049);
+    n += 2049;
+    for (m = 0; m < 256; m++) {
+      buf[n++] = (unsigned char)m;
+      memcpy(buf + n, pat, 4);
+      n += 4;
+    }
+  }
+  return n;
+}
+
+
+static void check_lazy_gain(void) {
+
+  unsigned char *buf;
+  unsigned char *comp;
+  char why[80];
+  int n, compSize, matches, dups, rc;
+
+  buf = (unsigned char *)malloc(4357);
+  if (buf == NULL) {
+    fail("lazy distant traps", "out of memory");
+    return;
+  }
+  n = fill_lazy_traps(buf, 1);
+  comp = NULL;
+  compSize = 0;
+  matches = -1;
+  dups = -1;
+  rc = deflate_bytes(buf, n, &comp, &compSize, &matches, &dups);
+  if (n != 4357 || rc != 0 || matches != 519 || dups != 3839) {
+    sprintf(why, "got %d matches and %d duplicate bytes", matches, dups);
+    fail("lazy distant traps", why);
+  }
+  else if (compSize > 980) {
+    sprintf(why, "compressed to %d bytes", compSize);
+    fail("lazy distant traps", why);
+  }
+  free(comp);
+  check_roundtrip("lazy distant traps", buf, n);
+  free(buf);
+
+  buf = (unsigned char *)malloc(16 * 4357);
+  if (buf == NULL) {
+    fail("lazy distant traps x16", "out of memory");
+    return;
+  }
+  n = fill_lazy_traps(buf, 16);
+  comp = NULL;
+  compSize = 0;
+  matches = -1;
+  dups = -1;
+  rc = deflate_bytes(buf, n, &comp, &compSize, &matches, &dups);
+  if (n != 16 * 4357 || rc != 0 || matches != 8304 || dups != 61454) {
+    sprintf(why, "got %d matches and %d duplicate bytes", matches, dups);
+    fail("lazy distant traps x16", why);
+  }
+  else if (compSize > 15000) {
+    sprintf(why, "compressed to %d bytes", compSize);
+    fail("lazy distant traps x16", why);
+  }
+  free(comp);
+  check_roundtrip("lazy distant traps x16", buf, n);
+  free(buf);
+}
+
+
 static void fill_lcg(unsigned char *buf, int n, unsigned long seed) {
 
   int i;
@@ -870,6 +966,8 @@ int main(void) {
   expect_matches("AAA matches", (const unsigned char *)"AAA", 3, 0, 0);
   expect_matches("AAAA matches", (const unsigned char *)"AAAA", 4, 1, 3);
   expect_matches("abcabc matches", (const unsigned char *)"abcabc", 6, 1, 3);
+  expect_matches("lazy aaabaaaab", (const unsigned char *)"aaabaaaab", 9, 1, 4);
+  check_roundtrip("lazy aaabaaaab", (const unsigned char *)"aaabaaaab", 9);
 
   buf = (unsigned char *)malloc(40000);
   if (buf == NULL) {
@@ -912,6 +1010,7 @@ int main(void) {
   check_roundtrip("distance 32768", buf, 40000);
 
   check_window(buf);
+  check_lazy_gain();
   check_errors();
   check_decoder_edges();
 

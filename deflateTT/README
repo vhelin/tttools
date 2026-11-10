@@ -29,13 +29,17 @@ vhelin#iki.fi.
 
 3. VERSION HISTORY
 
+v2.1 (10-Nov-2026)
+  * Matching is lazy, and a length-3 match farther than 4096 bytes is
+    not emitted.
+
 v2.0 (10-Nov-2026)
   * An empty alphabet and a one-symbol alphabet now get real one-bit
     codes. Previously a file with no 3-byte match crashed, and a run of
     identical bytes produced a DEFc file inflateTT could not read.
   * Code lengths are limited to 15 bits.
   * LZ77 uses a 3-byte hash chain and a 32768-byte window.
-  * Reads, writes and allocations are checked. Lengths are int.
+  * Reads, writes and allocations are checked.
 
 v1.21 (25-Feb-2010)
   * Thanks to Carl ùdahl for a bug fix. deflateTT would sometimes
