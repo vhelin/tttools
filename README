@@ -23,10 +23,10 @@ deflateTT reads a raw file and writes DEFd. inflateTT does the reverse.
 
 The compressor may write several blocks. Each block is Huffman-coded
 or stored uncompressed, whichever is smaller, and a match can refer to
-a byte written by an earlier block. Matches are lazy LZ77 over a
-32768-byte window, found with a 3-byte hash chain. A match of length 3
-is kept only when its distance is at most 4096, and any match is
-skipped when the next byte starts a longer one.
+a byte written by an earlier block. Matches are LZ77 over a 32768-byte
+window, found with a 3-byte hash chain and chosen by bit cost, so a
+shorter nearer copy is kept when it encodes in fewer bits. A split is
+kept only when the blocks are smaller than one block.
 Code lengths are limited to 15 bits. An alphabet with fewer than two used
 symbols is given two length-1 codes, so a run of identical bytes and a file
 with no repeated 3-byte sequence both round-trip.

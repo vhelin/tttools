@@ -9,7 +9,8 @@
 
 deflateTT is a command-line compressor for the DEFd container.
 Literal, length and distance symbols follow RFC 1951. The bitstream
-does not: it is MSB-first, one block, with a custom code-length header.
+does not: it is MSB-first, one or more Huffman or stored blocks, with a
+custom code-length header.
 See the repository README for the layout. Stock zlib cannot read these
 files.
 

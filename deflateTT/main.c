@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <limits.h>
+#include <string.h>
 
 #include "deflate.h"
 #include "huffman.h"
@@ -22,9 +23,10 @@
 #define LZ_MAX_DIST 32768
 #define LZ_MAX_LEN  258
 #define LZ_MIN_LEN  3
-#define LZ_TOO_FAR  4096
 #define LZ_HASH_BITS 15
 #define LZ_HASH_SIZE (1 << LZ_HASH_BITS)
+#define PRICE_PASSES 2
+#define BLOCK_MAX 16
 
 #define LIT_SYMBOLS  286
 #define DIST_SYMBOLS 30
@@ -43,6 +45,10 @@ static int codeLengths[LENGTH_TOTAL];
 static int codeLiterals[LIT_SYMBOLS];
 static int codeDistances[DIST_SYMBOLS];
 static int codeCombined[119];
+
+static int litPrice[256];
+static int lenPrice[LZ_MAX_LEN + 1];
+static int distPrice[LZ_MAX_DIST + 1];
 
 
 static const int extraBitsLengths[29] = {
@@ -202,152 +208,459 @@ static void lz_insert(const unsigned char *data, int fileSize, int *head, int *p
 }
 
 
-/* Longest match at i. The chain is newest-first, so an equal length keeps
-   the nearer copy. A length-3 match farther than LZ_TOO_FAR costs more
-   than three literals, so it is not reported. */
-static void lz_find(const unsigned char *data, int fileSize, const int *head,
-                    const int *prev, int i, int *bestLenOut, int *bestDistOut) {
+static int fixed_symbol_bits(int sym) {
 
-  int h, j, n, dist, chain, bestLen, bestDist, limit;
-
-  bestLen = 0;
-  bestDist = 0;
-  limit = 0;
-
-  if (i + LZ_MIN_LEN <= fileSize) {
-    limit = fileSize - i;
-    if (limit > LZ_MAX_LEN)
-      limit = LZ_MAX_LEN;
-    h = (int)lz_hash(data + i);
-    chain = 0;
-    for (j = head[h]; j >= 0; j = prev[j]) {
-      chain++;
-      if (chain > fileSize)
-        break;
-      dist = i - j;
-      if (dist <= 0 || dist > LZ_MAX_DIST)
-        break;
-      if (i + bestLen < fileSize && data[j + bestLen] != data[i + bestLen])
-        continue;
-      n = 0;
-      while (n + 4 <= limit &&
-             data[j + n] == data[i + n] &&
-             data[j + n + 1] == data[i + n + 1] &&
-             data[j + n + 2] == data[i + n + 2] &&
-             data[j + n + 3] == data[i + n + 3])
-        n += 4;
-      while (n < limit && data[j + n] == data[i + n])
-        n++;
-      if (n > bestLen) {
-        bestLen = n;
-        bestDist = dist;
-        if (bestLen == LZ_MAX_LEN || i + bestLen == fileSize)
-          break;
-      }
-    }
-  }
-
-  if (bestLen == LZ_MIN_LEN && bestDist > LZ_TOO_FAR) {
-    bestLen = 0;
-    bestDist = 0;
-  }
-
-  *bestLenOut = bestLen;
-  *bestDistOut = bestDist;
+  if (sym < 144)
+    return 8;
+  if (sym < 256)
+    return 9;
+  if (sym < 280)
+    return 7;
+  return 8;
 }
 
 
-/* Lazy LZ77. A 3-byte hash chain replaces the old window scan.
-   A match shorter than 258 bytes is skipped when the next byte starts
-   a longer one. A match of 258 bytes cannot be beaten by the next byte. */
-static int lz77_compress(const unsigned char *data, int fileSize, int *lz77,
-                         int lz77Cap, int *lz77SizeOut, int *matches, int *dupBytes) {
+static int length_symbol(int len, int *extraOut) {
 
-  int *head, *prev;
-  int i, k, bestLen, bestDist, nextLen, nextDist, lz77Size;
-  int matchCount, duplicateBytes;
+  int j;
 
-  head = NULL;
-  prev = NULL;
-  matchCount = 0;
-  duplicateBytes = 0;
-  lz77Size = 0;
-
-  if (fileSize < 0 || lz77 == NULL || lz77Cap < 1)
+  if (len < LZ_MIN_LEN || len > LZ_MAX_LEN)
     return -1;
-
-  if (fileSize > 0) {
-    head = (int *)malloc(sizeof(int) * LZ_HASH_SIZE);
-    prev = (int *)malloc(sizeof(int) * fileSize);
-    if (head == NULL || prev == NULL) {
-      free(head);
-      free(prev);
-      return -1;
-    }
-    for (i = 0; i < LZ_HASH_SIZE; i++)
-      head[i] = -1;
+  if (len <= 10) {
+    *extraOut = 0;
+    return 254 + len;
   }
+  if (len == LZ_MAX_LEN) {
+    *extraOut = 0;
+    return 285;
+  }
+  for (j = 0; j < 20; j++) {
+    if (len < extraBitsLimitsLength[j + 1]) {
+      *extraOut = len - extraBitsLimitsLength[j];
+      return 265 + j;
+    }
+  }
+  return -1;
+}
+
+
+static int distance_symbol(int dist, int *extraOut) {
+
+  int j;
+
+  if (dist < 1 || dist > LZ_MAX_DIST)
+    return -1;
+  if (dist <= 4) {
+    *extraOut = 0;
+    return dist - 1;
+  }
+  for (j = 0; j < 26; j++) {
+    if (dist < extraBitsLimitsDistance[j + 1]) {
+      *extraOut = dist - extraBitsLimitsDistance[j];
+      return 4 + j;
+    }
+  }
+  return -1;
+}
+
+
+static int fill_prices(const int *litBits, const int *distBits) {
+
+  int len, dist, sym, extra, bits;
+
+  for (sym = 0; sym < 256; sym++) {
+    bits = litBits[sym];
+    if (bits <= 0)
+      bits = 12;
+    litPrice[sym] = bits;
+  }
+  for (len = LZ_MIN_LEN; len <= LZ_MAX_LEN; len++) {
+    sym = length_symbol(len, &extra);
+    if (sym < 0)
+      return -1;
+    bits = litBits[sym];
+    if (bits <= 0)
+      bits = 12;
+    lenPrice[len] = bits + extraBitsLengths[sym - 257];
+  }
+  for (dist = 1; dist <= LZ_MAX_DIST; dist++) {
+    sym = distance_symbol(dist, &extra);
+    if (sym < 0)
+      return -1;
+    bits = distBits[sym];
+    if (bits <= 0)
+      bits = 12;
+    distPrice[dist] = bits + extraBitsDistances[sym];
+  }
+  return 0;
+}
+
+
+static int set_fixed_prices(void) {
+
+  int litBits[LIT_SYMBOLS];
+  int distBits[DIST_SYMBOLS];
+  int i;
+
+  for (i = 0; i < LIT_SYMBOLS; i++)
+    litBits[i] = fixed_symbol_bits(i);
+  for (i = 0; i < DIST_SYMBOLS; i++)
+    distBits[i] = 5;
+  return fill_prices(litBits, distBits);
+}
+
+
+/* Prices from a raw token stream: literals, length+254, raw distance. */
+static int price_from_tokens(const int *lz77, int lz77Size) {
+
+  int i, sym, len, dist, extra;
+
+  for (i = 0; i < LIT_SYMBOLS; i++)
+    freqLiterals[i] = 0;
+  for (i = 0; i < DIST_SYMBOLS; i++)
+    freqDistances[i] = 0;
 
   i = 0;
-  while (i < fileSize) {
-    lz_find(data, fileSize, head, prev, i, &bestLen, &bestDist);
-    lz_insert(data, fileSize, head, prev, i);
-
-    if (bestLen >= LZ_MIN_LEN && bestLen < LZ_MAX_LEN &&
-        i + 1 + LZ_MIN_LEN <= fileSize) {
-      lz_find(data, fileSize, head, prev, i + 1, &nextLen, &nextDist);
-      if (nextLen > bestLen && nextDist > 0) {
-        if (lz77Size + 1 >= lz77Cap) {
-          free(head);
-          free(prev);
-          return -1;
-        }
-        lz77[lz77Size++] = data[i];
-        i++;
-        continue;
-      }
-    }
-
-    if (bestLen >= LZ_MIN_LEN) {
-      if (lz77Size + 2 >= lz77Cap) {
-        free(head);
-        free(prev);
-        return -1;
-      }
-      lz77[lz77Size++] = bestLen + 254;
-      lz77[lz77Size++] = bestDist;
-      matchCount++;
-      duplicateBytes += bestLen;
-
-      for (k = 1; k < bestLen; k++)
-        lz_insert(data, fileSize, head, prev, i + k);
-      i += bestLen;
-    }
-    else {
-      if (lz77Size + 1 >= lz77Cap) {
-        free(head);
-        free(prev);
-        return -1;
-      }
-      lz77[lz77Size++] = data[i];
+  while (i < lz77Size) {
+    sym = lz77[i];
+    if (sym < 256) {
+      freqLiterals[sym]++;
       i++;
     }
+    else if (sym == 256) {
+      freqLiterals[256]++;
+      i++;
+    }
+    else {
+      len = sym - 254;
+      if (len < LZ_MIN_LEN || len > LZ_MAX_LEN || i + 1 >= lz77Size)
+        return -1;
+      sym = length_symbol(len, &extra);
+      if (sym < 0)
+        return -1;
+      freqLiterals[sym]++;
+      dist = lz77[i + 1];
+      if (dist < 1 || dist > LZ_MAX_DIST)
+        return -1;
+      sym = distance_symbol(dist, &extra);
+      if (sym < 0)
+        return -1;
+      freqDistances[sym]++;
+      i += 2;
+    }
   }
 
-  if (lz77Size + 1 > lz77Cap) {
-    free(head);
-    free(prev);
+  if (huffmanBuildCodes(freqLiterals, LIT_SYMBOLS, codeLengthLiterals, codeLiterals) != 0 ||
+      huffmanBuildCodes(freqDistances, DIST_SYMBOLS, codeLengthDistances, codeDistances) != 0)
     return -1;
-  }
-  lz77[lz77Size++] = 256;
+  return fill_prices(codeLengthLiterals, codeLengthDistances);
+}
 
-  free(head);
-  free(prev);
-  *lz77SizeOut = lz77Size;
+
+/* Nearest distance for every length from 3 through the longest match.
+   The chain is newest-first, and a longer distance is never a cheaper
+   code for the same length. Returns 0 when nothing reaches length 3. */
+static int lz_front(const unsigned char *data, int fileSize, const int *head,
+                    const int *prev, int i, int *distAt) {
+
+  int h, j, n, dist, chain, longest, limit, len;
+
+  longest = 0;
+  if (i + LZ_MIN_LEN > fileSize)
+    return 0;
+
+  limit = fileSize - i;
+  if (limit > LZ_MAX_LEN)
+    limit = LZ_MAX_LEN;
+  h = (int)lz_hash(data + i);
+  chain = 0;
+  for (j = head[h]; j >= 0; j = prev[j]) {
+    chain++;
+    if (chain > fileSize)
+      break;
+    dist = i - j;
+    if (dist <= 0 || dist > LZ_MAX_DIST)
+      break;
+    if (longest < limit && data[j + longest] != data[i + longest])
+      continue;
+    n = 0;
+    while (n + 4 <= limit &&
+           data[j + n] == data[i + n] &&
+           data[j + n + 1] == data[i + n + 1] &&
+           data[j + n + 2] == data[i + n + 2] &&
+           data[j + n + 3] == data[i + n + 3])
+      n += 4;
+    while (n < limit && data[j + n] == data[i + n])
+      n++;
+    if (n > longest) {
+      len = longest + 1;
+      if (len < LZ_MIN_LEN)
+        len = LZ_MIN_LEN;
+      for (; len <= n; len++)
+        distAt[len] = dist;
+      longest = n;
+      if (longest == limit)
+        break;
+    }
+  }
+
+  if (longest < LZ_MIN_LEN)
+    return 0;
+  return longest;
+}
+
+
+static int add_cost(int base, int price) {
+
+  if (base < 0 || price < 0 || base > INT_MAX - price)
+    return -1;
+  return base + price;
+}
+
+
+static int trace_tokens(const unsigned char *data, int fileSize,
+                        const int *prevLen, const int *prevDist,
+                        int *lz77, int lz77Cap, int *lz77SizeOut,
+                        int *matches, int *dupBytes) {
+
+  int i, n, pos, len, dist, matchCount, duplicateBytes;
+
+  n = 0;
+  matchCount = 0;
+  duplicateBytes = 0;
+  i = fileSize;
+  while (i > 0) {
+    len = prevLen[i];
+    if (len == 1) {
+      n++;
+    }
+    else if (len >= LZ_MIN_LEN && len <= i && prevDist[i] >= 1) {
+      n += 2;
+      matchCount++;
+      duplicateBytes += len;
+    }
+    else
+      return -1;
+    i -= len;
+  }
+  if (n + 1 > lz77Cap)
+    return -1;
+
+  pos = n;
+  lz77[pos] = 256;
+  i = fileSize;
+  while (i > 0) {
+    len = prevLen[i];
+    if (len == 1) {
+      pos--;
+      lz77[pos] = data[i - 1];
+    }
+    else {
+      dist = prevDist[i];
+      pos -= 2;
+      lz77[pos] = len + 254;
+      lz77[pos + 1] = dist;
+    }
+    i -= len;
+  }
+  if (pos != 0)
+    return -1;
+
+  *lz77SizeOut = n + 1;
   if (matches != NULL)
     *matches = matchCount;
   if (dupBytes != NULL)
     *dupBytes = duplicateBytes;
+  return 0;
+}
+
+
+/* One priced pass. An equal cost keeps the literal path, which is tried
+   first at each position and is allowed to replace a tied match. */
+static int parse_priced(const unsigned char *data, int fileSize, int *head, int *prev,
+                        int *cost, int *prevLen, int *prevDist,
+                        int *lz77, int lz77Cap, int *lz77SizeOut,
+                        int *matches, int *dupBytes) {
+
+  int distAt[LZ_MAX_LEN + 1];
+  int i, h, len, longest, dist, step, c;
+
+  for (h = 0; h < LZ_HASH_SIZE; h++)
+    head[h] = -1;
+  for (i = 0; i <= fileSize; i++) {
+    cost[i] = INT_MAX;
+    prevLen[i] = 0;
+    prevDist[i] = 0;
+  }
+  cost[0] = 0;
+
+  for (i = 0; i < fileSize; i++) {
+    if (cost[i] == INT_MAX)
+      continue;
+    c = add_cost(cost[i], litPrice[data[i]]);
+    if (c >= 0 && c <= cost[i + 1]) {
+      cost[i + 1] = c;
+      prevLen[i + 1] = 1;
+      prevDist[i + 1] = 0;
+    }
+
+    longest = lz_front(data, fileSize, head, prev, i, distAt);
+    for (len = LZ_MIN_LEN; len <= longest; len++) {
+      dist = distAt[len];
+      if (dist < 1 || dist > LZ_MAX_DIST)
+        return -1;
+      if (lenPrice[len] > INT_MAX - distPrice[dist])
+        continue;
+      step = lenPrice[len] + distPrice[dist];
+      c = add_cost(cost[i], step);
+      if (c >= 0 && c < cost[i + len]) {
+        cost[i + len] = c;
+        prevLen[i + len] = len;
+        prevDist[i + len] = dist;
+      }
+    }
+    lz_insert(data, fileSize, head, prev, i);
+  }
+
+  if (fileSize > 0 && prevLen[fileSize] < 1)
+    return -1;
+  return trace_tokens(data, fileSize, prevLen, prevDist, lz77, lz77Cap,
+                      lz77SizeOut, matches, dupBytes);
+}
+
+
+static int preprocess_lz77(int *lz77, int lz77Size);
+static int huffman_cost(const int *lz77, int tok0, int tok1);
+
+
+/* Priced LZ77. The first pass uses fixed Huffman prices. The second uses
+   the code lengths of the first. The pass whose one-block encoding is
+   smaller is kept, so a later pass cannot throw away a cheaper match. */
+static int lz77_compress(const unsigned char *data, int fileSize, int *lz77,
+                         int lz77Cap, int *lz77SizeOut, int *matches, int *dupBytes) {
+
+  int *head, *prev, *cost, *prevLen, *prevDist, *best, *cooked;
+  int pass, lz77Size, passMatches, passDups, passCost;
+  int bestSize, bestCost, bestMatches, bestDups;
+
+  head = NULL;
+  prev = NULL;
+  cost = NULL;
+  prevLen = NULL;
+  prevDist = NULL;
+  best = NULL;
+  cooked = NULL;
+  lz77Size = 0;
+  bestSize = 0;
+  bestCost = INT_MAX;
+  bestMatches = 0;
+  bestDups = 0;
+
+  if (fileSize < 0 || lz77 == NULL || lz77Cap < 1)
+    return -1;
+
+  if (fileSize == 0) {
+    lz77[0] = 256;
+    *lz77SizeOut = 1;
+    if (matches != NULL)
+      *matches = 0;
+    if (dupBytes != NULL)
+      *dupBytes = 0;
+    return 0;
+  }
+
+  head = (int *)malloc(sizeof(int) * LZ_HASH_SIZE);
+  prev = (int *)malloc(sizeof(int) * fileSize);
+  cost = (int *)malloc(sizeof(int) * (fileSize + 1));
+  prevLen = (int *)malloc(sizeof(int) * (fileSize + 1));
+  prevDist = (int *)malloc(sizeof(int) * (fileSize + 1));
+  best = (int *)malloc(sizeof(int) * lz77Cap);
+  if (head == NULL || prev == NULL || cost == NULL || prevLen == NULL ||
+      prevDist == NULL || best == NULL) {
+    free(head);
+    free(prev);
+    free(cost);
+    free(prevLen);
+    free(prevDist);
+    free(best);
+    return -1;
+  }
+
+  if (set_fixed_prices() != 0) {
+    free(head);
+    free(prev);
+    free(cost);
+    free(prevLen);
+    free(prevDist);
+    free(best);
+    return -1;
+  }
+
+  for (pass = 0; pass < PRICE_PASSES; pass++) {
+    passMatches = 0;
+    passDups = 0;
+    if (parse_priced(data, fileSize, head, prev, cost, prevLen, prevDist,
+                     lz77, lz77Cap, &lz77Size, &passMatches, &passDups) != 0) {
+      free(head);
+      free(prev);
+      free(cost);
+      free(prevLen);
+      free(prevDist);
+      free(best);
+      return -1;
+    }
+
+    cooked = (int *)malloc(sizeof(int) * lz77Size);
+    if (cooked == NULL) {
+      free(head);
+      free(prev);
+      free(cost);
+      free(prevLen);
+      free(prevDist);
+      free(best);
+      return -1;
+    }
+    memcpy(cooked, lz77, sizeof(int) * lz77Size);
+    passCost = -1;
+    if (preprocess_lz77(cooked, lz77Size) == 0)
+      passCost = huffman_cost(cooked, 0, lz77Size - 1);
+    free(cooked);
+    cooked = NULL;
+    if (passCost >= 0 && (bestSize == 0 || passCost < bestCost)) {
+      memcpy(best, lz77, sizeof(int) * lz77Size);
+      bestSize = lz77Size;
+      bestCost = passCost;
+      bestMatches = passMatches;
+      bestDups = passDups;
+    }
+
+    if (pass + 1 < PRICE_PASSES && price_from_tokens(lz77, lz77Size) != 0) {
+      free(head);
+      free(prev);
+      free(cost);
+      free(prevLen);
+      free(prevDist);
+      free(best);
+      return -1;
+    }
+  }
+
+  free(head);
+  free(prev);
+  free(cost);
+  free(prevLen);
+  free(prevDist);
+  if (bestSize < 1) {
+    free(best);
+    return -1;
+  }
+  memcpy(lz77, best, sizeof(int) * bestSize);
+  free(best);
+  *lz77SizeOut = bestSize;
+  if (matches != NULL)
+    *matches = bestMatches;
+  if (dupBytes != NULL)
+    *dupBytes = bestDups;
   return 0;
 }
 
@@ -1019,43 +1332,64 @@ static int segment_choice(const int *lz77, int tok0, int tok1,
 }
 
 
-static int consider_blocks(const int *lz77, const int *tokAt, const int *byteAt,
-                           int i0, int i1, int i2, int i3, int nparts,
-                           struct blockseg *best, int *bestN, int *bestCost) {
+static int cand_add(int *cand, int n, int cap, int value) {
 
-  struct blockseg part[3];
-  int idx[4];
-  int p, total, stored, partCost, raw;
+  int i;
 
-  idx[0] = i0;
-  idx[1] = i1;
-  idx[2] = i2;
-  idx[3] = i3;
-  total = 0;
-  for (p = 0; p < nparts; p++) {
-    raw = byteAt[idx[p + 1]] - byteAt[idx[p]];
-    if (raw == 0 && nparts > 1)
-      return 0;
-    if (segment_choice(lz77, tokAt[idx[p]], tokAt[idx[p + 1]],
-                       byteAt[idx[p]], byteAt[idx[p + 1]],
-                       &stored, &partCost) != 0)
-      return -1;
-    if (partCost < 0 || partCost > INT_MAX - total)
-      return -1;
-    total += partCost;
-    part[p].tok0 = tokAt[idx[p]];
-    part[p].tok1 = tokAt[idx[p + 1]];
-    part[p].byte0 = byteAt[idx[p]];
-    part[p].byte1 = byteAt[idx[p + 1]];
-    part[p].stored = stored;
+  if (value <= 0)
+    return n;
+  for (i = 0; i < n; i++) {
+    if (cand[i] == value)
+      return n;
   }
-  if (total < *bestCost) {
-    *bestCost = total;
-    *bestN = nparts;
-    for (p = 0; p < nparts; p++)
-      best[p] = part[p];
+  if (n >= cap)
+    return n;
+  cand[n] = value;
+  return n + 1;
+}
+
+
+static void sort_cands(int *cand, int n) {
+
+  int i, j, key;
+
+  for (i = 1; i < n; i++) {
+    key = cand[i];
+    j = i;
+    while (j > 0 && cand[j - 1] > key) {
+      cand[j] = cand[j - 1];
+      j--;
+    }
+    cand[j] = key;
   }
-  return 0;
+}
+
+
+/* One block, plus histogram peaks and a coarse grid of token boundaries.
+   The dynamic program below keeps a split only when it is strictly smaller. */
+static int gather_cands(const unsigned char *input, int inputSize,
+                        const int *byteAt, int nbounds, int *cand, int cap) {
+
+  int n, k, target, bound, s0, s1, nf;
+
+  cand[0] = 0;
+  n = 1;
+  if (nbounds >= 3 && inputSize >= 2048 && cap > 2) {
+    find_splits(input, inputSize, &s0, &s1, &nf);
+    if (nf >= 1)
+      n = cand_add(cand, n, cap - 1, snap_bound(byteAt, nbounds, s0));
+    if (nf >= 2)
+      n = cand_add(cand, n, cap - 1, snap_bound(byteAt, nbounds, s1));
+    for (k = 1; k < BLOCK_MAX; k++) {
+      target = (int)(((unsigned long)inputSize * (unsigned long)k) / (unsigned long)BLOCK_MAX);
+      bound = snap_bound(byteAt, nbounds, target);
+      n = cand_add(cand, n, cap - 1, bound);
+    }
+  }
+  if (nbounds - 1 > 0)
+    n = cand_add(cand, n, cap, nbounds - 1);
+  sort_cands(cand, n);
+  return n;
 }
 
 
@@ -1063,51 +1397,91 @@ static int plan_blocks(const unsigned char *input, int inputSize,
                        const int *lz77, const int *tokAt, const int *byteAt,
                        int nbounds, struct blockseg *plan, int *planCount) {
 
-  struct blockseg best[3];
-  int bestN, bestCost, nf, s0, s1, a, b, lo, hi;
+  int cand[BLOCK_MAX + 1];
+  int dp[BLOCK_MAX + 1];
+  int prevc[BLOCK_MAX + 1];
+  int stack[BLOCK_MAX + 1];
+  int nc, s, t, sp, stored, partCost, total, parts;
 
-  bestN = 0;
-  bestCost = INT_MAX;
-  a = -1;
-  b = -1;
-  if (consider_blocks(lz77, tokAt, byteAt, 0, nbounds - 1, 0, 0, 1,
-                      best, &bestN, &bestCost) != 0)
+  if (nbounds < 1)
     return -1;
-
-  find_splits(input, inputSize, &s0, &s1, &nf);
-  if (nf >= 1) {
-    a = snap_bound(byteAt, nbounds, s0);
-    if (a > 0 &&
-        consider_blocks(lz77, tokAt, byteAt, 0, a, nbounds - 1, 0, 2,
-                        best, &bestN, &bestCost) != 0)
-      return -1;
+  if (nbounds < 2) {
+    plan[0].tok0 = 0;
+    plan[0].tok1 = 0;
+    plan[0].byte0 = 0;
+    plan[0].byte1 = 0;
+    plan[0].stored = 0;
+    *planCount = 1;
+    return 0;
   }
-  if (nf >= 2) {
-    b = snap_bound(byteAt, nbounds, s1);
-    if (b > 0 && b != a &&
-        consider_blocks(lz77, tokAt, byteAt, 0, b, nbounds - 1, 0, 2,
-                        best, &bestN, &bestCost) != 0)
-      return -1;
-    if (a > 0 && b > 0 && a != b) {
-      if (a < b) {
-        lo = a;
-        hi = b;
-      }
-      else {
-        lo = b;
-        hi = a;
-      }
-      if (consider_blocks(lz77, tokAt, byteAt, 0, lo, hi, nbounds - 1, 3,
-                          best, &bestN, &bestCost) != 0)
+
+  nc = gather_cands(input, inputSize, byteAt, nbounds, cand, BLOCK_MAX + 1);
+  if (nc < 1 || cand[0] != 0)
+    return -1;
+  if (nc == 1) {
+    cand[1] = nbounds - 1;
+    nc = 2;
+  }
+
+  dp[0] = 0;
+  prevc[0] = -1;
+  for (t = 1; t < nc; t++) {
+    dp[t] = INT_MAX;
+    prevc[t] = -1;
+    for (s = 0; s < t; s++) {
+      if (dp[s] == INT_MAX)
+        continue;
+      if (byteAt[cand[t]] == byteAt[cand[s]])
+        continue;
+      if (segment_choice(lz77, tokAt[cand[s]], tokAt[cand[t]],
+                         byteAt[cand[s]], byteAt[cand[t]],
+                         &stored, &partCost) != 0)
         return -1;
+      if (partCost < 0 || dp[s] > INT_MAX - partCost)
+        continue;
+      total = dp[s] + partCost;
+      if (total < dp[t]) {
+        dp[t] = total;
+        prevc[t] = s;
+      }
     }
+    if (prevc[t] < 0)
+      return -1;
   }
 
-  if (bestN < 1)
+  sp = 0;
+  t = nc - 1;
+  while (t > 0) {
+    if (sp >= BLOCK_MAX || prevc[t] < 0)
+      return -1;
+    stack[sp] = t;
+    sp++;
+    t = prevc[t];
+  }
+
+  parts = 0;
+  s = 0;
+  while (sp > 0) {
+    sp--;
+    t = stack[sp];
+    if (parts >= BLOCK_MAX)
+      return -1;
+    if (segment_choice(lz77, tokAt[cand[s]], tokAt[cand[t]],
+                       byteAt[cand[s]], byteAt[cand[t]],
+                       &stored, &partCost) != 0)
+      return -1;
+    plan[parts].tok0 = tokAt[cand[s]];
+    plan[parts].tok1 = tokAt[cand[t]];
+    plan[parts].byte0 = byteAt[cand[s]];
+    plan[parts].byte1 = byteAt[cand[t]];
+    plan[parts].stored = stored;
+    parts++;
+    s = t;
+  }
+
+  if (parts < 1)
     return -1;
-  for (lo = 0; lo < bestN; lo++)
-    plan[lo] = best[lo];
-  *planCount = bestN;
+  *planCount = parts;
   return 0;
 }
 
@@ -1119,7 +1493,7 @@ int deflate_bytes(const unsigned char *input, int inputSize,
   int *lz77;
   int *tokAt;
   int *byteAt;
-  struct blockseg segs[3];
+  struct blockseg segs[BLOCK_MAX];
   int lz77Size, i, nbounds, nsegs;
   int matchCount, dupBytes, allocCount;
   struct bitbuf bits;
